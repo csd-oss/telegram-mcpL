@@ -1,7 +1,7 @@
 """Messages MCP tools."""
 
 from telegram_mcp.runtime import *
-from telegram_mcp import transcription
+from telegram_mcp import polls, transcription
 from telegram_mcp.sent import chat_id_of, sent_ids, sent_note
 from pydantic import StrictInt
 
@@ -2499,6 +2499,7 @@ async def create_poll(
             random_id=random.randint(0, 2**63 - 1),
         )
         result = await cl(request)
+        polls.note_sent(result)
         note = sent_note(sent_ids(result, request.random_id), chat_id_of(entity, chat_id))
         return f"Poll created ({note})."
     except Exception as e:
@@ -2562,6 +2563,68 @@ async def vote_poll(
         return f"Vote submitted for poll {message_id} in chat {chat_id}."
     except Exception as e:
         return log_and_format_error("vote_poll", e, chat_id=chat_id, message_id=message_id)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Get Poll Results", openWorldHint=True, readOnlyHint=True)
+)
+@with_account(readonly=True)
+@validate_id("chat_id")
+async def get_poll_results(
+    chat_id: Union[int, str],
+    message_id: StrictInt,
+    account: Optional[str] = None,
+) -> str:
+    """Read a poll's results: options with voter counts and percentages, total
+    voters, whether it is closed and, for a poll with public votes, which options
+    each voter chose.
+
+    Args:
+        chat_id: The ID or username of the chat containing the poll.
+        message_id: The message ID of the poll.
+        account: Account name to use (optional).
+
+    A user account asks Telegram for the votes. A bot account can't; it lists the
+    votes it was sent since the server started (bots are only told about votes on
+    polls they sent), while the counts always come from Telegram.
+    """
+    try:
+        if type(message_id) is not int or message_id <= 0:
+            return "Error: message_id must be a positive integer."
+
+        cl = get_client(account)
+        entity = await resolve_entity(chat_id, cl)
+        if is_chat_allowlist_enabled() and not is_chat_allowed(chat_id, entity):
+            raise ChatAccessDeniedError(check_chat_access(chat_id, entity))
+
+        message = await cl.get_messages(entity, ids=message_id)
+        if message is None or not isinstance(message.media, types.MessageMediaPoll):
+            return "Error: Message not found or does not contain a poll."
+        poll, results = message.media.poll, message.media.results
+        if getattr(results, "results", None) is None:
+            results = polls.results_for(poll.id) or results
+        polls.note_poll(poll.id, chat_id_of(entity, chat_id), message_id)
+
+        votes = None
+        metadata = None
+        if poll.public_voters:
+            if await cl.is_bot():
+                votes = []
+                for voter_id, options in polls.votes_for(poll.id).items():
+                    try:
+                        voter = await cl.get_entity(voter_id)
+                    except Exception:  # noqa: BLE001 — an unresolvable voter still counts
+                        voter = None
+                    votes.append((polls.voter_record(voter, voter_id), options))
+                metadata = {"votes_note": "Votes received since the server started."}
+            else:
+                votes = await polls.fetch_votes(cl, entity, message_id)
+
+        record = {"chat_id": chat_id_of(entity, chat_id), "message_id": message_id}
+        record.update(polls.poll_record(poll, results, votes))
+        return format_tool_result([record], metadata=metadata)
+    except Exception as e:
+        return log_and_format_error("get_poll_results", e, chat_id=chat_id, message_id=message_id)
 
 
 @mcp.tool(

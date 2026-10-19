@@ -86,6 +86,7 @@ TOOL_CLASSES: dict[str, tuple[str, ...]] = {
     "get_scheduled_messages": _COMMS,
     "get_drafts": _COMMS,
     "get_message_reactions": _COMMS,
+    "get_poll_results": _COMMS,
     "get_message_read_by": _COMMS,
     "list_inline_buttons": _COMMS,
     "get_media_info": _COMMS,
