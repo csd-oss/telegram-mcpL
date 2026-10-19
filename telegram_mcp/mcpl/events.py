@@ -13,6 +13,10 @@ metadata rich enough to drive the host's `shouldTriggerInference` filter:
   - threadId for forum-topic supergroups
   - isPrivate, accountLabel
 
+A vote on a poll this account sent (bots only: Telegram tells a bot who voted)
+is pushed the same way, as "[poll vote] <voter> chose: A, C (poll: <question>,
+message_id N)" once the poll has been quiet for POLL_VOTE_DEBOUNCE_SECONDS.
+
 The handler emits `channels/incoming` notifications via the transport.
 Errors are swallowed and logged so a buggy mapping never tears down the
 event loop.
@@ -20,20 +24,24 @@ event loop.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.tl.types import (
     Channel,
     Chat,
     MessageEntityMention,
     MessageEntityMentionName,
+    MessageMediaPoll,
+    UpdateMessagePollVote,
     User,
 )
 
 from sanitize import sanitize_name
+from telegram_mcp import polls
 
 from .access import chat_allowed
 from .channels import (
@@ -53,6 +61,7 @@ if TYPE_CHECKING:
 log = logging.getLogger("telegram_mcp.mcpl")
 
 REPLY_SNIPPET_MAX = 200
+POLL_VOTE_DEBOUNCE_SECONDS = 10.0
 
 # Tracks clients that already have MCPL handlers attached, so a host
 # reconnect (which fires on_ready again) doesn't double-attach and cause
@@ -377,6 +386,108 @@ async def build_incoming_message(
     return incoming
 
 
+class PollVoteBatcher:
+    """Holds a poll's voters until no vote has arrived for `delay` seconds, then
+    hands them to `flush`, so a voter who changes their choice (or ticks several
+    options one by one) is pushed once, with the final choice."""
+
+    def __init__(self, flush, delay: float = POLL_VOTE_DEBOUNCE_SECONDS):
+        self._flush = flush
+        self._delay = delay
+        self._voters: dict[int, set[int]] = {}
+        self._timers: dict[int, asyncio.Task] = {}
+
+    def add(self, poll_id: int, voter_id: int) -> None:
+        self._voters.setdefault(poll_id, set()).add(voter_id)
+        timer = self._timers.get(poll_id)
+        if timer is not None:
+            timer.cancel()
+        self._timers[poll_id] = asyncio.create_task(self._fire(poll_id))
+
+    async def _fire(self, poll_id: int) -> None:
+        await asyncio.sleep(self._delay)
+        del self._timers[poll_id]
+        voters = sorted(self._voters.pop(poll_id, ()))
+        try:
+            await self._flush(poll_id, voters)
+        except Exception:
+            log.exception("Failed to push votes for poll %s", poll_id)
+
+
+async def build_poll_vote_messages(
+    client: Any,
+    poll_id: int,
+    voter_ids: list[int],
+    *,
+    account_label: str,
+    self_id: int,
+) -> list[ChannelIncomingMessage]:
+    """One ChannelIncomingMessage per voter with their current choice, e.g.
+    "[poll vote] Mykhailo (@mk) chose: A, C (poll: Lunch?, message_id 42)".
+
+    Empty when the poll's chat is unknown (the vote update names only the poll,
+    so a poll sent before a restart can't be placed) or not allowed.
+    """
+    location = polls.where(poll_id)
+    if location is None:
+        log.info("vote on poll %s not pushed: its chat is unknown", poll_id)
+        return []
+    chat_id, message_id = location
+    chat = await client.get_entity(chat_id)
+    descriptor = entity_to_descriptor(chat, account_label=account_label, self_id=self_id)
+    if descriptor is None or not chat_allowed(chat_id, chat):
+        return []
+    message = await client.get_messages(chat, ids=message_id)
+    media = getattr(message, "media", None)
+    if not isinstance(media, MessageMediaPoll):
+        return []
+    question = media.poll.question.text
+    chat_kind = descriptor["metadata"]["kind"]
+    now = datetime.now(timezone.utc)
+
+    out: list[ChannelIncomingMessage] = []
+    for voter_id in voter_ids:
+        try:
+            voter = await client.get_entity(voter_id)
+        except Exception:  # noqa: BLE001 — the vote still counts without a name
+            voter = None
+        author = _author_dict(voter) if voter is not None else {"id": str(voter_id)}
+        author["name"] = sanitize_name(author.get("name") or f"id:{voter_id}")
+        username = getattr(voter, "username", None)
+        name = _header_name(author["name"]) + (f" (@{username})" if username else "")
+        chosen = polls.option_texts(media.poll, polls.choice(poll_id, voter_id))
+        action = f"chose: {', '.join(chosen)}" if chosen else "retracted their vote"
+        text = f"[poll vote] {name} {action} (poll: {question}, message_id {message_id})"
+        metadata: dict[str, Any] = {
+            "account": account_label,
+            "botUserId": str(self_id),
+            "chatType": chat_kind,
+            "chatTitle": descriptor["label"],
+            "isPrivate": chat_kind in ("dm", "saved"),
+            "isMention": False,
+            "isReply": True,
+            "isReplyToBot": True,
+            "replyToMessageId": str(message_id),
+            "mentionIds": [],
+            "isForward": False,
+            "isPollVote": True,
+            "senderId": str(voter_id),
+        }
+        if username:
+            metadata["senderUsername"] = username
+        out.append(
+            {
+                "channelId": descriptor["id"],
+                "messageId": f"poll-vote-{message_id}-{voter_id}-{int(now.timestamp())}",
+                "author": author,
+                "timestamp": now.isoformat(),
+                "content": [{"type": "text", "text": text}],
+                "metadata": metadata,
+            }
+        )
+    return out
+
+
 async def _build_chat_action_payload(
     event: events.ChatAction.Event,
     *,
@@ -457,6 +568,7 @@ async def attach_event_handlers(
 
     Currently:
       - NewMessage → channels/incoming
+      - UpdateMessagePollVote → channels/incoming, debounced per poll
       - ChatAction → channels/changed (joins, leaves, kicks affecting us)
 
     `policy` (MCPL 0.5, §5.4): when given, every push is checked against the
@@ -480,6 +592,29 @@ async def attach_event_handlers(
     self_id = int(getattr(me, "id"))
     self_username = getattr(me, "username", None)
 
+    async def push_incoming(payloads: list[ChannelIncomingMessage], get_chat) -> None:
+        if policy is not None and not policy.can_push_incoming:
+            log.info(
+                "channels/incoming suppressed — channels.incoming not granted "
+                "(policy_received=%s fs_enabled=%s)",
+                policy.policy_received,
+                policy.fs_enabled,
+            )
+            return
+        channel_id = payloads[0]["channelId"]
+        if (policy is None or policy.can_register) and not is_registered(channel_id):
+            # Best effort: a failed registration must not cost the message itself.
+            try:
+                await register_if_new(
+                    transport,
+                    await get_chat(),
+                    account_label=account_label,
+                    self_id=self_id,
+                )
+            except Exception:  # noqa: BLE001
+                log.warning("could not register %s before its first message", channel_id)
+        await transport.send_notification("channels/incoming", {"messages": payloads})
+
     @client.on(events.NewMessage)
     async def on_new_message(event):  # pragma: no cover — real-Telegram path
         # Skip outgoing messages — Telethon fires NewMessage for messages we
@@ -498,30 +633,23 @@ async def attach_event_handlers(
             )
             if payload is None:
                 return
-            if policy is not None and not policy.can_push_incoming:
-                log.info(
-                    "channels/incoming suppressed — channels.incoming not granted "
-                    "(policy_received=%s fs_enabled=%s)",
-                    policy.policy_received,
-                    policy.fs_enabled,
-                )
-                return
-            if (policy is None or policy.can_register) and not is_registered(payload["channelId"]):
-                # Best effort: a failed registration must not cost the message itself.
-                try:
-                    await register_if_new(
-                        transport,
-                        await event.get_chat(),
-                        account_label=account_label,
-                        self_id=self_id,
-                    )
-                except Exception:  # noqa: BLE001
-                    log.warning(
-                        "could not register %s before its first message", payload["channelId"]
-                    )
-            await transport.send_notification("channels/incoming", {"messages": [payload]})
+            await push_incoming([payload], lambda: event.get_chat())
         except Exception:
             log.exception("Failed to push NewMessage event")
+
+    async def push_poll_votes(poll_id: int, voter_ids: list[int]) -> None:
+        payloads = await build_poll_vote_messages(
+            client, poll_id, voter_ids, account_label=account_label, self_id=self_id
+        )
+        if payloads:
+            chat_id, _ = polls.where(poll_id)
+            await push_incoming(payloads, lambda: client.get_entity(chat_id))
+
+    poll_votes = PollVoteBatcher(push_poll_votes)
+
+    @client.on(events.Raw(UpdateMessagePollVote))
+    async def on_poll_vote(update):  # pragma: no cover — real-Telegram path
+        poll_votes.add(update.poll_id, utils.get_peer_id(update.peer))
 
     @client.on(events.ChatAction)
     async def on_chat_action(event):  # pragma: no cover — real-Telegram path
@@ -542,7 +670,8 @@ async def attach_event_handlers(
 
     _attached_clients.add(id(client))
     log.info(
-        "Attached MCPL handlers (NewMessage, ChatAction) for account '%s' " "(self_id=%s)",
+        "Attached MCPL handlers (NewMessage, poll votes, ChatAction) for account '%s' "
+        "(self_id=%s)",
         account_label,
         self_id,
     )

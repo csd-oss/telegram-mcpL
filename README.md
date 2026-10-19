@@ -68,6 +68,12 @@ This may replace an existing vote; empty selections, duplicate or out-of-range
 indices, closed polls, and multiple answers in single-choice polls are rejected.
 Telegram enforces voting permissions and restrictions on changing quiz votes.
 
+`get_poll_results(chat_id, message_id, account=None)` reads a poll: the question,
+each option's voter count and percentage, total voters, and whether it is closed.
+For a poll with public votes it also lists which options each voter chose. A user
+account asks Telegram for the votes; a bot can't, so it lists the votes it was
+sent since the server started (Telegram tells a bot about votes on polls it sent).
+
 - **Contacts:** list, search, add, delete, block, unblock, import, export, inspect direct chats, find recent contact interactions, and remember contacts by the names you actually use (see below).
 
 ### Remembered contacts
@@ -179,6 +185,18 @@ Misha (@magnumlink) [message_id 311] [forwarded from Some Channel, 2026-10-14 09
 
 The same facts are in the event metadata (`messageId`, `replyToMessageId`,
 `isForward`, `forwardFrom`, `forwardDate`).
+
+A bot also hears votes on the public polls it sent. Once a poll has had no new
+vote for 10 seconds, each voter's final choice arrives as an incoming message in
+the poll's chat (metadata `isPollVote`, `replyToMessageId` = the poll):
+
+```
+[poll vote] Mykhailo (@mk) chose: Pizza, Salad (poll: Lunch?, message_id 42)
+```
+
+A vote names only the poll, not its chat, so a vote on a poll sent before the
+last restart is dropped until the server has seen that poll again (a poll update
+or a `get_poll_results` call).
 
 ### Incoming Event Feed (callback mode, Claude Code only)
 

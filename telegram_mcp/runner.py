@@ -18,6 +18,7 @@ if hasattr(sys.stderr, "reconfigure"):
         pass
 
 from telegram_mcp import runtime as _runtime
+from telegram_mcp import polls as _polls
 from telegram_mcp import transcription as _transcription
 from telegram_mcp.runtime import *
 from telegram_mcp.singleton import (
@@ -338,6 +339,8 @@ async def _main() -> None:
         await asyncio.gather(
             *(_connect_authorized_client(label, cl) for label, cl in clients.items())
         )
+        for cl in clients.values():
+            _polls.attach(cl)
 
         # Warm entity caches — StringSession has no persistent cache,
         # so fetch all dialogs once per client to populate them.
