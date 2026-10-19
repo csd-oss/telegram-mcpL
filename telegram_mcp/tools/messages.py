@@ -413,6 +413,31 @@ def format_message_line(msg, chat_id: Optional[int] = None) -> str:
     return " | ".join(parts) + f" | Message: {safe_text}"
 
 
+
+def _default_parse_mode(parse_mode, format_date=None, custom_emojis=None):
+    """Apply TELEGRAM_DEFAULT_PARSE_MODE (e.g. 'md') when the caller gave none.
+
+    Only for plain sends: format_date / custom_emojis build their own entities.
+    'plain' or an empty value keeps the old behaviour (text sent verbatim).
+    """
+    if parse_mode or format_date or custom_emojis:
+        return parse_mode, False
+    import os
+    default = (os.getenv("TELEGRAM_DEFAULT_PARSE_MODE") or "").strip().lower()
+    if default in ("", "plain", "none"):
+        return parse_mode, False
+    return default, True
+
+
+async def _send_with_default(cl, entity, text, parse_mode, defaulted, **kwargs):
+    """send_message; if a defaulted parse mode is rejected, resend as plain text."""
+    try:
+        return await cl.send_message(entity, text, parse_mode=parse_mode, **kwargs)
+    except Exception:
+        if not defaulted:
+            raise
+        return await cl.send_message(entity, text, parse_mode=None, **kwargs)
+
 @mcp.tool(annotations=ToolAnnotations(title="Get Messages", openWorldHint=True, readOnlyHint=True))
 @with_account(readonly=True)
 @validate_id("chat_id")
@@ -809,7 +834,8 @@ async def send_message(
             result = await cl(request)
             ids = sent_ids(result, request.random_id)
         else:
-            ids = sent_ids(await cl.send_message(entity, message, parse_mode=parse_mode))
+            parse_mode, defaulted = _default_parse_mode(parse_mode)
+            ids = sent_ids(await _send_with_default(cl, entity, message, parse_mode, defaulted))
         return f"Message sent ({sent_note(ids, chat_id_of(entity, chat_id))})."
     except Exception as e:
         return log_and_format_error("send_message", e, chat_id=chat_id)
@@ -2166,7 +2192,9 @@ async def reply_to_message(
             ids = sent_ids(result, request.random_id)
         else:
             ids = sent_ids(
-                await cl.send_message(entity, text, reply_to=message_id, parse_mode=parse_mode)
+                await _send_with_default(
+                    cl, entity, text, *_default_parse_mode(parse_mode), reply_to=message_id
+                )
             )
         return (
             f"Reply to message {message_id} sent ({sent_note(ids, chat_id_of(entity, chat_id))})."
