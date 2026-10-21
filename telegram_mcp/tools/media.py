@@ -10,6 +10,7 @@ from pypdf import PdfReader
 
 from telegram_mcp.runtime import *
 
+from telegram_mcp import video
 from telegram_mcp.sent import chat_id_of, sent_ids, sent_note
 from telegram_mcp.contact_sheet import ContactSheetUnavailable, build_contact_sheet
 from telegram_mcp.photo_source import (
@@ -36,6 +37,33 @@ def _known_media_size(message) -> Optional[int]:
 
 class _DownloadLimitExceeded(Exception):
     """Stop an in-progress media download once it exceeds the configured limit."""
+
+
+async def _video_media(cl, path: str):
+    """The path for Telethon to upload, or for a video an uploaded document with its real shape.
+
+    Telethon reads a video's size only through hachoir (else it sends 1x1, which phones crop
+    to a square tile), parses it on the event loop, and its album path takes no attributes at
+    all. So we probe the video off the loop and hand over finished InputMedia, which Telethon
+    sends as is. Anything that isn't a video goes back as the path, as before.
+    """
+    if not video.is_video(path):
+        return path
+    info = await asyncio.to_thread(video.probe_video, path)
+    if info is None:
+        # Unreadable to both probers: Telethon's own attributes, also computed off the loop.
+        attributes, mime_type = await asyncio.to_thread(utils.get_attributes, path)
+        thumb = None
+    else:
+        attributes, mime_type = video.document_attributes(path, info), video.mime_type(path)
+        thumb = await asyncio.to_thread(video.thumbnail_jpeg, path, info)
+    return types.InputMediaUploadedDocument(
+        file=await cl.upload_file(path),
+        mime_type=mime_type,
+        attributes=attributes,
+        thumb=await cl.upload_file(thumb, file_name="thumb.jpg") if thumb else None,
+        nosound_video=True,  # as Telethon's album path: a silent video stays a video, not a GIF
+    )
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Send File", openWorldHint=True, destructiveHint=True))
@@ -92,7 +120,11 @@ async def send_file(
             return path_error
         entity = await resolve_entity(chat_id, cl)
         sent = await cl.send_file(
-            entity, str(safe_path), caption=caption, reply_to=topic_id, schedule=dt
+            entity,
+            await _video_media(cl, str(safe_path)),
+            caption=caption,
+            reply_to=topic_id,
+            schedule=dt,
         )
         note = sent_note(sent_ids(sent), chat_id_of(entity, chat_id))
         if dt:
@@ -141,7 +173,8 @@ async def _send_album(
         safe_paths.append(str(safe_path))
 
     entity = await resolve_entity(chat_id, cl)
-    sent = await cl.send_file(entity, safe_paths, caption=caption, reply_to=topic_id, schedule=dt)
+    items = [await _video_media(cl, path) for path in safe_paths]
+    sent = await cl.send_file(entity, items, caption=caption, reply_to=topic_id, schedule=dt)
     note = sent_note(sent_ids(sent), chat_id_of(entity, chat_id))
     if dt:
         return (
