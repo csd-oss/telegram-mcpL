@@ -1,5 +1,6 @@
 import io
 import shutil
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -109,6 +110,18 @@ def test_hachoir_reads_displayed_size_and_duration(fixture, expected, without_ff
     assert video.probe_video(str(fixture)) == video.VideoInfo(*expected, 2.0)
 
 
+def test_hachoir_defaults_a_missing_matroska_display_height(tmp_path, without_ffmpeg):
+    """Matroska may leave DisplayHeight out; it then defaults to the coded height."""
+    display_height = bytes.fromhex("54ba820438")  # DisplayHeight = 1080
+    void = bytes.fromhex("ec83000000")  # Void element of the same length
+    data = ANAMORPHIC_WEBM.read_bytes()
+    assert data.count(display_height) == 1
+    trimmed = tmp_path / "trimmed.webm"
+    trimmed.write_bytes(data.replace(display_height, void))
+
+    assert video.probe_video(str(trimmed)) == video.VideoInfo(1920, 1080, 2.0)
+
+
 def test_unreadable_video_has_no_info(tmp_path):
     broken = tmp_path / "broken.mp4"
     broken.write_bytes(b"not a video")
@@ -175,13 +188,23 @@ async def test_send_file_leaves_other_files_to_telethon(client, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_send_file_leaves_unreadable_video_to_telethon(client, tmp_path):
-    (tmp_path / "broken.mp4").write_bytes(b"not a video")
+async def test_unreadable_video_gets_telethons_attributes_off_the_loop(client, monkeypatch):
+    (Path(runtime.SERVER_ALLOWED_ROOTS[0]) / "broken.mp4").write_bytes(b"not a video")
+    threads = []
+    get_attributes = media.utils.get_attributes
+
+    def _recording_get_attributes(*args, **kwargs):
+        threads.append(threading.current_thread())
+        return get_attributes(*args, **kwargs)
+
+    monkeypatch.setattr(media.utils, "get_attributes", _recording_get_attributes)
 
     await media.send_file("chat", "broken.mp4")
 
     (call,) = client.calls
-    assert call["file"] == str(tmp_path / "broken.mp4")
+    assert call["file"].mime_type == "video/mp4"
+    assert types.DocumentAttributeFilename("broken.mp4") in call["file"].attributes
+    assert threads and threading.main_thread() not in threads
 
 
 @pytest.mark.asyncio

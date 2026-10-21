@@ -45,18 +45,22 @@ async def _video_media(cl, path: str):
     Telethon reads a video's size only through hachoir (else it sends 1x1, which phones crop
     to a square tile), parses it on the event loop, and its album path takes no attributes at
     all. So we probe the video off the loop and hand over finished InputMedia, which Telethon
-    sends as is. Anything that isn't a readable video goes back as the path, as before.
+    sends as is. Anything that isn't a video goes back as the path, as before.
     """
     if not video.is_video(path):
         return path
     info = await asyncio.to_thread(video.probe_video, path)
     if info is None:
-        return path
-    thumb = await asyncio.to_thread(video.thumbnail_jpeg, path, info)
+        # Unreadable to both probers: Telethon's own attributes, also computed off the loop.
+        attributes, mime_type = await asyncio.to_thread(utils.get_attributes, path)
+        thumb = None
+    else:
+        attributes, mime_type = video.document_attributes(path, info), video.mime_type(path)
+        thumb = await asyncio.to_thread(video.thumbnail_jpeg, path, info)
     return types.InputMediaUploadedDocument(
         file=await cl.upload_file(path),
-        mime_type=video.mime_type(path),
-        attributes=video.document_attributes(path, info),
+        mime_type=mime_type,
+        attributes=attributes,
         thumb=await cl.upload_file(thumb, file_name="thumb.jpg") if thumb else None,
         nosound_video=True,  # as Telethon's album path: a silent video stays a video, not a GIF
     )

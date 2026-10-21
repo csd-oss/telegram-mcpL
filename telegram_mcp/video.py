@@ -180,8 +180,9 @@ def _mkv_display_width(parser, width: int, height: int) -> int:
     """Width at the first video track's display aspect ratio (Matroska/WebM only).
 
     hachoir reports the coded PixelWidth; DisplayWidth/DisplayHeight carry the shape it is
-    shown in (in pixels, or any unit: only their ratio matters here). MP4 needs no such step,
-    hachoir already reads its track header's presentation size.
+    shown in (in pixels, or any unit: only their ratio matters here), and either one left out
+    defaults to the coded size. MP4 needs no such step, hachoir already reads its track
+    header's presentation size.
     """
     if parser.PARSER_TAGS.get("id") != "matroska":
         return width
@@ -194,11 +195,12 @@ def _mkv_display_width(parser, width: int, height: int) -> int:
                     if "Video" not in track:
                         continue
                     shown = track["Video"]
-                    if "DisplayWidth/unsigned" in shown and "DisplayHeight/unsigned" in shown:
-                        display_width = shown["DisplayWidth/unsigned"].value
-                        display_height = shown["DisplayHeight/unsigned"].value
-                        if display_width > 0 and display_height > 0:
-                            return max(1, round(height * display_width / display_height))
+                    display_width, display_height = (
+                        shown[f"{name}/unsigned"].value if f"{name}/unsigned" in shown else coded
+                        for name, coded in (("DisplayWidth", width), ("DisplayHeight", height))
+                    )
+                    if display_width > 0 and display_height > 0:
+                        return max(1, round(height * display_width / display_height))
                     return width
     except Exception:
         pass
@@ -262,6 +264,8 @@ def thumbnail_jpeg(path: str, info: VideoInfo) -> Optional[bytes]:
                     f"{start:.3f}",
                     "-i",
                     path,
+                    "-map",
+                    "0:v:0",  # the stream probe_video measured
                     "-frames:v",
                     "1",
                     "-vf",
