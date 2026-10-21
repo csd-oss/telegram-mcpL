@@ -16,7 +16,8 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Optional
+from fractions import Fraction
+from typing import List, Optional
 
 from telethon import types
 
@@ -24,11 +25,19 @@ VIDEO_EXTENSIONS = (".mp4", ".mov", ".m4v", ".webm")
 THUMBNAIL_EDGE_PIXELS = 320  # Telegram's limit for a document thumbnail
 THUMBNAIL_SEEK_SECONDS = 1.0
 PROBE_TIMEOUT_SECONDS = 30
+# ffmpeg may only open the file itself as MP4/MOV or Matroska/WebM: other demuxers (concat,
+# HLS, image sequences) can read further files the path check never saw.
+FFMPEG_INPUT_OPTIONS = [
+    "-protocol_whitelist",
+    "file",
+    "-format_whitelist",
+    "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm",
+]
 
 
 @dataclass(frozen=True)
 class VideoInfo:
-    """Size as displayed (rotation applied) and duration in seconds."""
+    """Size as displayed (aspect ratio and rotation applied) and duration in seconds."""
 
     width: int
     height: int
@@ -48,8 +57,16 @@ def is_video(path: str) -> bool:
     return mime.startswith("video/") or path.lower().endswith(VIDEO_EXTENSIONS)
 
 
+def mime_type(path: str) -> str:
+    return mimetypes.guess_type(path)[0] or "video/mp4"
+
+
+def document_attributes(path: str, info: VideoInfo) -> List[types.TypeDocumentAttribute]:
+    return [types.DocumentAttributeFilename(os.path.basename(path)), info.attribute()]
+
+
 def _displayed(width: int, height: int, rotation: float) -> tuple[int, int]:
-    """Swap the coded size for a quarter-turn rotation (portrait phone videos)."""
+    """Swap the size for a quarter-turn rotation (portrait phone videos)."""
     if round(rotation) % 180 == 90:
         return height, width
     return width, height
@@ -71,6 +88,17 @@ def _positive_float(value) -> Optional[float]:
     return number if math.isfinite(number) and number > 0 else None
 
 
+def _sample_aspect_ratio(value) -> Fraction:
+    """ffprobe's "4:3"-style pixel aspect ratio; 1 when absent or unknown ("0:1")."""
+    try:
+        numerator, denominator = (int(part) for part in str(value).split(":"))
+    except ValueError:
+        return Fraction(1)
+    if numerator <= 0 or denominator <= 0:
+        return Fraction(1)
+    return Fraction(numerator, denominator)
+
+
 def _probe_ffprobe(path: str) -> Optional[VideoInfo]:
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
@@ -81,6 +109,7 @@ def _probe_ffprobe(path: str) -> Optional[VideoInfo]:
                 ffprobe,
                 "-v",
                 "error",
+                *FFMPEG_INPUT_OPTIONS,
                 "-select_streams",
                 "v:0",
                 "-show_streams",
@@ -103,6 +132,8 @@ def _probe_ffprobe(path: str) -> Optional[VideoInfo]:
     width, height = stream.get("width"), stream.get("height")
     if not (isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0):
         return None
+    # Anamorphic video (non-square pixels) displays wider or narrower than it is coded.
+    width = max(1, round(width * _sample_aspect_ratio(stream.get("sample_aspect_ratio"))))
     # Newer ffmpeg reports rotation as Display Matrix side data, older as a "rotate" tag.
     rotation = next(
         (
@@ -145,6 +176,35 @@ def _mp4_rotation(parser) -> float:
     return 0.0
 
 
+def _mkv_display_width(parser, width: int, height: int) -> int:
+    """Width at the first video track's display aspect ratio (Matroska/WebM only).
+
+    hachoir reports the coded PixelWidth; DisplayWidth/DisplayHeight carry the shape it is
+    shown in (in pixels, or any unit: only their ratio matters here). MP4 needs no such step,
+    hachoir already reads its track header's presentation size.
+    """
+    if parser.PARSER_TAGS.get("id") != "matroska":
+        return width
+    try:
+        for segment in parser.array("Segment"):
+            for field in segment:
+                if not field.name.startswith("Tracks["):
+                    continue
+                for track in field.array("TrackEntry"):
+                    if "Video" not in track:
+                        continue
+                    shown = track["Video"]
+                    if "DisplayWidth/unsigned" in shown and "DisplayHeight/unsigned" in shown:
+                        display_width = shown["DisplayWidth/unsigned"].value
+                        display_height = shown["DisplayHeight/unsigned"].value
+                        if display_width > 0 and display_height > 0:
+                            return max(1, round(height * display_width / display_height))
+                    return width
+    except Exception:
+        pass
+    return width
+
+
 def _probe_hachoir(path: str) -> Optional[VideoInfo]:
     try:
         from hachoir.metadata import extractMetadata
@@ -167,6 +227,7 @@ def _probe_hachoir(path: str) -> Optional[VideoInfo]:
             width, height = int(sized.get("width")), int(sized.get("height"))
             timed = next((m for m in sources if m.has("duration")), None)
             duration = timed.get("duration").total_seconds() if timed else 0.0
+            width = _mkv_display_width(parser, width, height)
             rotation = _mp4_rotation(parser)
     except Exception:
         return None
@@ -181,23 +242,22 @@ def probe_video(path: str) -> Optional[VideoInfo]:
     return _probe_ffprobe(path) or _probe_hachoir(path)
 
 
-def make_thumbnail(path: str, info: VideoInfo, out_dir: str) -> Optional[str]:
-    """JPEG frame at ~1 s, longest edge 320 px, in out_dir; None without ffmpeg or on failure."""
+def thumbnail_jpeg(path: str, info: VideoInfo) -> Optional[bytes]:
+    """JPEG frame at ~1 s, longest edge 320 px; None without ffmpeg or on failure."""
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return None
-    out = os.path.join(out_dir, os.path.basename(path) + ".thumb.jpg")
     seek = min(THUMBNAIL_SEEK_SECONDS, info.duration / 2) if info.duration else 0.0
     edge = THUMBNAIL_EDGE_PIXELS
-    # ffmpeg applies the rotation itself (autorotate), so the frame comes out upright.
+    # ffmpeg applies the rotation itself (autorotate); the first scale squares the pixels.
     for start in dict.fromkeys((seek, 0.0)):
         try:
-            subprocess.run(
+            completed = subprocess.run(
                 [
                     ffmpeg,
                     "-v",
                     "error",
-                    "-y",
+                    *FFMPEG_INPUT_OPTIONS,
                     "-ss",
                     f"{start:.3f}",
                     "-i",
@@ -205,10 +265,14 @@ def make_thumbnail(path: str, info: VideoInfo, out_dir: str) -> Optional[str]:
                     "-frames:v",
                     "1",
                     "-vf",
-                    f"scale={edge}:{edge}:force_original_aspect_ratio=decrease",
+                    f"scale=iw*sar:ih,scale={edge}:{edge}:force_original_aspect_ratio=decrease",
+                    "-f",
+                    "image2pipe",
+                    "-c:v",
+                    "mjpeg",
                     "-q:v",
                     "5",
-                    out,
+                    "pipe:1",
                 ],
                 capture_output=True,
                 timeout=PROBE_TIMEOUT_SECONDS,
@@ -216,6 +280,6 @@ def make_thumbnail(path: str, info: VideoInfo, out_dir: str) -> Optional[str]:
             )
         except (OSError, subprocess.SubprocessError):
             continue
-        if os.path.isfile(out) and os.path.getsize(out) > 0:
-            return out
+        if completed.stdout:
+            return completed.stdout
     return None

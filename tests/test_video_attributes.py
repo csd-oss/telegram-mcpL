@@ -1,8 +1,10 @@
+import io
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 from telethon import types
 
 from telegram_mcp import runtime, video
@@ -11,6 +13,9 @@ from telegram_mcp.tools import media
 FIXTURES = Path(__file__).parent / "fixtures"
 LANDSCAPE = FIXTURES / "landscape_1920x1080.mp4"  # 2 s, 1920x1080
 PORTRAIT = FIXTURES / "portrait_rotated_1920x1080.mp4"  # same frames, display matrix 90°
+# 1440x1080 coded with 4:3 pixels: shown as 1920x1080
+ANAMORPHIC_MP4 = FIXTURES / "anamorphic_1440x1080_sar4-3.mp4"
+ANAMORPHIC_WEBM = FIXTURES / "anamorphic_1440x1080_sar4-3.webm"
 
 needs_ffmpeg = pytest.mark.skipif(
     not (shutil.which("ffmpeg") and shutil.which("ffprobe")), reason="ffmpeg not installed"
@@ -29,23 +34,15 @@ class _VideoClient:
         self.uploads = []
 
     async def send_file(self, entity, file, **kwargs):
-        thumb = kwargs.get("thumb")
-        self.calls.append(
-            {
-                "file": file,
-                **kwargs,
-                "thumb_existed": bool(thumb) and Path(thumb).is_file(),
-            }
-        )
+        self.calls.append({"file": file, **kwargs})
         if isinstance(file, list):
             return [SimpleNamespace(id=601 + i) for i in range(len(file))]
         return SimpleNamespace(id=601)
 
-    async def upload_file(self, path):
-        self.uploads.append(path)
-        return types.InputFile(
-            id=len(self.uploads), parts=1, name=Path(path).name, md5_checksum=""
-        )
+    async def upload_file(self, file, file_name=None):
+        self.uploads.append(file)
+        name = file_name or Path(file).name
+        return types.InputFile(id=len(self.uploads), parts=1, name=name, md5_checksum="")
 
 
 @pytest.fixture
@@ -65,9 +62,15 @@ def client(tmp_path, monkeypatch):
     return client
 
 
-def _video_attribute(attributes):
-    (attribute,) = [a for a in attributes if isinstance(a, types.DocumentAttributeVideo)]
-    return attribute
+def _assert_video(item, size, file_name):
+    assert isinstance(item, types.InputMediaUploadedDocument)
+    assert item.mime_type == "video/mp4"
+    assert item.nosound_video
+    filename, attribute = item.attributes
+    assert filename == types.DocumentAttributeFilename(file_name)
+    assert isinstance(attribute, types.DocumentAttributeVideo)
+    assert (attribute.w, attribute.h, attribute.duration) == (*size, 2.0)
+    assert attribute.supports_streaming
 
 
 @pytest.mark.parametrize(
@@ -80,21 +83,30 @@ def test_is_video(name, expected):
 
 
 @needs_ffmpeg
-def test_ffprobe_reads_size_and_duration():
-    assert video.probe_video(str(LANDSCAPE)) == video.VideoInfo(1920, 1080, 2.0)
+@pytest.mark.parametrize(
+    ("fixture", "expected"),
+    [
+        (LANDSCAPE, (1920, 1080)),
+        (PORTRAIT, (1080, 1920)),
+        (ANAMORPHIC_MP4, (1920, 1080)),
+        (ANAMORPHIC_WEBM, (1920, 1080)),
+    ],
+)
+def test_ffprobe_reads_displayed_size_and_duration(fixture, expected):
+    assert video._probe_ffprobe(str(fixture)) == video.VideoInfo(*expected, 2.0)
 
 
-@needs_ffmpeg
-def test_ffprobe_applies_rotation():
-    assert video.probe_video(str(PORTRAIT)) == video.VideoInfo(1080, 1920, 2.0)
-
-
-def test_hachoir_reads_size_and_duration(without_ffmpeg):
-    assert video.probe_video(str(LANDSCAPE)) == video.VideoInfo(1920, 1080, 2.0)
-
-
-def test_hachoir_applies_rotation(without_ffmpeg):
-    assert video.probe_video(str(PORTRAIT)) == video.VideoInfo(1080, 1920, 2.0)
+@pytest.mark.parametrize(
+    ("fixture", "expected"),
+    [
+        (LANDSCAPE, (1920, 1080)),
+        (PORTRAIT, (1080, 1920)),
+        (ANAMORPHIC_MP4, (1920, 1080)),
+        (ANAMORPHIC_WEBM, (1920, 1080)),
+    ],
+)
+def test_hachoir_reads_displayed_size_and_duration(fixture, expected, without_ffmpeg):
+    assert video.probe_video(str(fixture)) == video.VideoInfo(*expected, 2.0)
 
 
 def test_unreadable_video_has_no_info(tmp_path):
@@ -104,32 +116,42 @@ def test_unreadable_video_has_no_info(tmp_path):
 
 
 @needs_ffmpeg
-def test_thumbnail_is_at_most_320_px(tmp_path):
-    from PIL import Image
+def test_ffmpeg_does_not_follow_a_concat_manifest(tmp_path):
+    """A manifest named .mp4 must not make ffmpeg read (and thumbnail) another file."""
+    shutil.copy(LANDSCAPE, tmp_path / "elsewhere.mp4")
+    manifest = tmp_path / "clip.mp4"
+    manifest.write_text("ffconcat version 1.0\nfile elsewhere.mp4\n")
 
-    thumb = video.make_thumbnail(str(PORTRAIT), video.VideoInfo(1080, 1920, 2.0), str(tmp_path))
-    with Image.open(thumb) as image:
-        assert image.size == (180, 320)
+    assert video._probe_ffprobe(str(manifest)) is None
+    assert video.thumbnail_jpeg(str(manifest), video.VideoInfo(1920, 1080, 2.0)) is None
 
 
-def test_no_thumbnail_without_ffmpeg(tmp_path, without_ffmpeg):
-    assert (
-        video.make_thumbnail(str(LANDSCAPE), video.VideoInfo(1920, 1080, 2.0), str(tmp_path))
-        is None
-    )
+@needs_ffmpeg
+@pytest.mark.parametrize(
+    ("fixture", "expected"),
+    [(PORTRAIT, (180, 320)), (ANAMORPHIC_MP4, (320, 180))],
+)
+def test_thumbnail_is_the_displayed_shape_within_320_px(fixture, expected):
+    thumb = video.thumbnail_jpeg(str(fixture), video.probe_video(str(fixture)))
+    with Image.open(io.BytesIO(thumb)) as image:
+        assert image.format == "JPEG"
+        assert image.size == expected
+
+
+def test_no_thumbnail_without_ffmpeg(without_ffmpeg):
+    assert video.thumbnail_jpeg(str(LANDSCAPE), video.VideoInfo(1920, 1080, 2.0)) is None
 
 
 @pytest.mark.asyncio
-async def test_send_file_sends_1920x1080_video_with_its_size(client, without_ffmpeg):
+async def test_send_file_sends_1920x1080_video_with_its_size(client, tmp_path, without_ffmpeg):
     result = await media.send_file("chat", LANDSCAPE.name, caption="clip")
 
     assert result.startswith("File sent from")
     (call,) = client.calls
-    attribute = _video_attribute(call["attributes"])
-    assert (attribute.w, attribute.h, attribute.duration) == (1920, 1080, 2.0)
-    assert attribute.supports_streaming
-    assert call["supports_streaming"] is True
-    assert "thumb" not in call
+    _assert_video(call["file"], (1920, 1080), LANDSCAPE.name)
+    assert call["file"].thumb is None
+    assert call["caption"] == "clip"
+    assert client.uploads == [str(tmp_path / LANDSCAPE.name)]
 
 
 @needs_ffmpeg
@@ -138,18 +160,28 @@ async def test_send_file_attaches_thumbnail_with_ffmpeg(client):
     await media.send_file("chat", PORTRAIT.name)
 
     (call,) = client.calls
-    attribute = _video_attribute(call["attributes"])
-    assert (attribute.w, attribute.h) == (1080, 1920)
-    assert call["thumb_existed"]
-    assert not Path(call["thumb"]).exists()  # temporary, removed after the send
+    _assert_video(call["file"], (1080, 1920), PORTRAIT.name)
+    assert call["file"].thumb.name == "thumb.jpg"
+    assert isinstance(client.uploads[1], bytes)
 
 
 @pytest.mark.asyncio
-async def test_send_file_leaves_other_files_to_telethon(client):
+async def test_send_file_leaves_other_files_to_telethon(client, tmp_path):
     await media.send_file("chat", "photo.png")
 
     (call,) = client.calls
-    assert set(call) == {"file", "caption", "reply_to", "schedule", "thumb_existed"}
+    assert call["file"] == str(tmp_path / "photo.png")
+    assert client.uploads == []
+
+
+@pytest.mark.asyncio
+async def test_send_file_leaves_unreadable_video_to_telethon(client, tmp_path):
+    (tmp_path / "broken.mp4").write_bytes(b"not a video")
+
+    await media.send_file("chat", "broken.mp4")
+
+    (call,) = client.calls
+    assert call["file"] == str(tmp_path / "broken.mp4")
 
 
 @pytest.mark.asyncio
@@ -162,13 +194,9 @@ async def test_album_sends_each_video_with_its_size(client, tmp_path, without_ff
     (call,) = client.calls
     landscape, photo, portrait = call["file"]
     assert photo == str(tmp_path / "photo.png")
-    for item, size in ((landscape, (1920, 1080)), (portrait, (1080, 1920))):
-        assert isinstance(item, types.InputMediaUploadedDocument)
-        assert item.mime_type == "video/mp4"
-        assert item.nosound_video
-        attribute = _video_attribute(item.attributes)
-        assert (attribute.w, attribute.h, attribute.duration) == (*size, 2.0)
-        assert item.thumb is None
+    _assert_video(landscape, (1920, 1080), LANDSCAPE.name)
+    _assert_video(portrait, (1080, 1920), PORTRAIT.name)
+    assert landscape.thumb is None and portrait.thumb is None
     assert client.uploads == [str(tmp_path / LANDSCAPE.name), str(tmp_path / PORTRAIT.name)]
 
 
@@ -178,5 +206,5 @@ async def test_album_uploads_video_thumbnails_with_ffmpeg(client):
     await media.send_album("chat", [LANDSCAPE.name, PORTRAIT.name])
 
     (call,) = client.calls
-    assert all(item.thumb is not None for item in call["file"])
-    assert [Path(path).suffix for path in client.uploads] == [".mp4", ".jpg", ".mp4", ".jpg"]
+    assert [item.thumb.name for item in call["file"]] == ["thumb.jpg", "thumb.jpg"]
+    assert [type(upload) for upload in client.uploads] == [str, bytes, str, bytes]
