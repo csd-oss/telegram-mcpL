@@ -24,6 +24,7 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "dotenv>=0.9.9",
+    "hachoir>=3.3.0",
     "httpx>=0.28.1",
     "mcp[cli]>=1.30.0,<2",
     "pillow>=11.0.0",

@@ -10,6 +10,7 @@ from pypdf import PdfReader
 
 from telegram_mcp.runtime import *
 
+from telegram_mcp import video
 from telegram_mcp.sent import chat_id_of, sent_ids, sent_note
 from telegram_mcp.contact_sheet import ContactSheetUnavailable, build_contact_sheet
 from telegram_mcp.photo_source import (
@@ -36,6 +37,44 @@ def _known_media_size(message) -> Optional[int]:
 
 class _DownloadLimitExceeded(Exception):
     """Stop an in-progress media download once it exceeds the configured limit."""
+
+
+async def _video_send_kwargs(path: str, thumb_dir: str) -> Dict[str, Any]:
+    """send_file kwargs that keep a video's shape: size/duration attribute and a thumbnail.
+
+    Empty for anything that isn't a readable video, so other files go out as before.
+    """
+    if not video.is_video(path):
+        return {}
+    info = await asyncio.to_thread(video.probe_video, path)
+    if info is None:
+        return {}
+    kwargs = {"attributes": [info.attribute()], "supports_streaming": True}
+    thumb = await asyncio.to_thread(video.make_thumbnail, path, info, thumb_dir)
+    if thumb:
+        kwargs["thumb"] = thumb
+    return kwargs
+
+
+async def _album_item(cl, path: str, thumb_dir: str):
+    """A path for Telethon to upload, or for a video an uploaded document with its attributes.
+
+    Telethon's album upload takes no attributes or thumbnails, but passes InputMedia through.
+    """
+    kwargs = await _video_send_kwargs(path, thumb_dir)
+    if not kwargs:
+        return path
+    attributes, mime_type = utils.get_attributes(
+        path, attributes=kwargs["attributes"], supports_streaming=True
+    )
+    thumb = kwargs.get("thumb")
+    return types.InputMediaUploadedDocument(
+        file=await cl.upload_file(path),
+        mime_type=mime_type,
+        attributes=attributes,
+        thumb=await cl.upload_file(thumb) if thumb else None,
+        nosound_video=True,  # as Telethon's album path: a silent video stays a video, not a GIF
+    )
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Send File", openWorldHint=True, destructiveHint=True))
@@ -91,9 +130,15 @@ async def send_file(
         if path_error:
             return path_error
         entity = await resolve_entity(chat_id, cl)
-        sent = await cl.send_file(
-            entity, str(safe_path), caption=caption, reply_to=topic_id, schedule=dt
-        )
+        with tempfile.TemporaryDirectory(prefix="tg-thumb-") as thumb_dir:
+            sent = await cl.send_file(
+                entity,
+                str(safe_path),
+                caption=caption,
+                reply_to=topic_id,
+                schedule=dt,
+                **await _video_send_kwargs(str(safe_path), thumb_dir),
+            )
         note = sent_note(sent_ids(sent), chat_id_of(entity, chat_id))
         if dt:
             return f"File from {safe_path} scheduled for {dt.isoformat()} (scheduled {note})."
@@ -141,7 +186,9 @@ async def _send_album(
         safe_paths.append(str(safe_path))
 
     entity = await resolve_entity(chat_id, cl)
-    sent = await cl.send_file(entity, safe_paths, caption=caption, reply_to=topic_id, schedule=dt)
+    with tempfile.TemporaryDirectory(prefix="tg-thumb-") as thumb_dir:
+        items = [await _album_item(cl, path, thumb_dir) for path in safe_paths]
+        sent = await cl.send_file(entity, items, caption=caption, reply_to=topic_id, schedule=dt)
     note = sent_note(sent_ids(sent), chat_id_of(entity, chat_id))
     if dt:
         return (
