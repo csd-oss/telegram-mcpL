@@ -75,6 +75,7 @@ TOOL_CLASSES: dict[str, tuple[str, ...]] = {
     "mark_as_read": _COMMS,
     "save_draft": _COMMS,
     "clear_draft": _COMMS,
+    "send_typing": _COMMS,
     # --- comms: read people's messages and receipts --------------------------
     "get_messages": _COMMS,
     "list_messages": _COMMS,
@@ -100,12 +101,15 @@ TOOL_CLASSES: dict[str, tuple[str, ...]] = {
     # Block until people message the account, then return those chats.
     "wait_for_new_message": _COMMS,
     "wait_for_settled_message": _COMMS,
+    "wait_for_events": _COMMS,
+    "get_messages_after": _COMMS,
     # --- comms: chats, people, and lookups used to message them --------------
     "get_chats": _COMMS,
     "list_chats": _COMMS,
     "get_chat": _COMMS,
     "get_full_chat": _COMMS,
     "list_topics": _COMMS,
+    "list_forum_topic_icons": _COMMS,
     "search_public_chats": _COMMS,
     "resolve_username": _COMMS,
     "get_common_chats": _COMMS,
@@ -164,6 +168,7 @@ TOOL_CLASSES: dict[str, tuple[str, ...]] = {
     "create_forum_topic": _COMMS_CONTROL,
     "edit_forum_topic": _COMMS_CONTROL,
     "delete_forum_topic": _COMMS_CONTROL,
+    "upgrade_group_to_supergroup": _COMMS_CONTROL,
     "add_contact": _COMMS_CONTROL,
     "delete_contact": _COMMS_CONTROL,
     "import_contacts": _COMMS_CONTROL,
@@ -181,6 +186,7 @@ TOOL_CLASSES: dict[str, tuple[str, ...]] = {
     "get_folder": _COMMS_CONTROL,
     "get_folder_snapshot": _COMMS_CONTROL,
     "update_folder": _COMMS_CONTROL,
+    "get_chatlist_invite": _COMMS_CONTROL,
     "get_privacy_settings": _COMMS_CONTROL,
     "set_privacy_settings": _COMMS_CONTROL,
     # --- control: the account's own settings, folders and chat state ---------

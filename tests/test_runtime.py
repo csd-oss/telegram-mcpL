@@ -88,6 +88,29 @@ def test_get_exposed_tools_mode_rejects_invalid_value(monkeypatch):
     assert "read-only" in message
 
 
+def test_missing_api_credentials_exit_with_readable_error(monkeypatch, capsys):
+    monkeypatch.delenv("TELEGRAM_API_ID", raising=False)
+    monkeypatch.delenv("TELEGRAM_API_HASH", raising=False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._require_api_credentials()
+
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert "TELEGRAM_API_ID and TELEGRAM_API_HASH must be set" in err
+    assert "my.telegram.org" in err  # hint, not a bare traceback
+
+
+def test_non_integer_api_id_exits_with_readable_error(monkeypatch, capsys):
+    monkeypatch.setenv("TELEGRAM_API_ID", "not-a-number")
+    monkeypatch.setenv("TELEGRAM_API_HASH", "hash")
+
+    with pytest.raises(SystemExit):
+        runtime._require_api_credentials()
+
+    assert "TELEGRAM_API_ID must be an integer" in capsys.readouterr().err
+
+
 def _synthetic_mcp_with_two_writes():
     server = _synthetic_mcp()
 
@@ -543,6 +566,19 @@ def test_discover_accounts_exits_when_no_sessions_configured(monkeypatch):
         runtime._discover_accounts()
 
 
+def test_discover_accounts_folds_dash_labels_to_underscores(monkeypatch):
+    """MY-WORK and MY_WORK env spellings must land on the same account label."""
+    _clear_session_env(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_SESSION_STRING_MY-WORK", "work-session")
+    monkeypatch.setattr(runtime, "TelegramClient", _FakeTelegramClient)
+    monkeypatch.setattr(runtime, "StringSession", lambda value: f"StringSession:{value}")
+
+    accounts = runtime._discover_accounts()
+
+    assert list(accounts) == ["my_work"]
+    assert accounts["my_work"].args[0] == "StringSession:work-session"
+
+
 def _clear_proxy_env(monkeypatch):
     for key in list(runtime.os.environ):
         if key.startswith("TELEGRAM_PROXY_"):
@@ -752,6 +788,14 @@ async def test_with_account_routes_single_multi_and_readonly(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_reconnect_state(monkeypatch):
+    """Reconnect state is keyed by id(client), which CPython reuses across tests."""
+    monkeypatch.setattr(runtime, "_last_conn_verified", {})
+    monkeypatch.setattr(runtime, "_conn_locks", {})
+    monkeypatch.setattr(runtime, "_last_reconnect_failure", {})
+
+
 class _ConnectivityClient:
     def __init__(self, *, connected=True, authorized=True, ping_error=None):
         self.connected = connected
@@ -853,12 +897,42 @@ class _SlowConnectClient(_ConnectivityClient):
 @pytest.mark.asyncio
 async def test_ensure_connected_reconnects_once_for_concurrent_callers(monkeypatch):
     client = _SlowConnectClient(connected=False)
-    monkeypatch.setattr(runtime, "_last_conn_verified", {})
-    monkeypatch.setattr(runtime, "_conn_locks", {})
 
     await asyncio.gather(*(runtime.ensure_connected(client) for _ in range(3)))
 
     assert client.calls.count("connect") == 1
+
+
+class _FailingConnectClient(_ConnectivityClient):
+    async def connect(self):
+        self.calls.append("connect")
+        raise ConnectionError("network down")
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_replays_failed_reconnect_to_waiters():
+    """Callers queued behind a failed reconnect reuse its error instead of retrying (#298)."""
+    client = _FailingConnectClient(connected=False)
+
+    results = await asyncio.gather(
+        *(runtime.ensure_connected(client) for _ in range(3)), return_exceptions=True
+    )
+
+    assert client.calls.count("connect") == 1
+    assert client.calls.count("disconnect") == 1
+    assert all(isinstance(result, ConnectionError) for result in results)
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_retries_reconnect_after_cached_failure_goes_stale():
+    client = _ConnectivityClient(connected=False, authorized=True)
+    stale = runtime.time.time() - 2 * runtime._RECONNECT_FAILURE_TTL
+    runtime._last_reconnect_failure[id(client)] = (stale, RuntimeError("old attempt"))
+
+    await runtime.ensure_connected(client)
+
+    assert "connect" in client.calls
+    assert id(client) not in runtime._last_reconnect_failure
 
 
 class _HangingConnectClient(_ConnectivityClient):
@@ -1224,6 +1298,69 @@ async def test_more_file_resolution_edges(tmp_path, monkeypatch):
     )
     assert out_path is None
     assert error == "Path is outside allowed roots."
+
+
+@pytest.mark.asyncio
+async def test_resolve_writable_file_path_default_avoids_nested_downloads(tmp_path, monkeypatch):
+    downloads_root = (tmp_path / "Downloads").resolve()
+    downloads_root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [downloads_root])
+    monkeypatch.delenv("TELEGRAM_DOWNLOAD_SUBDIR", raising=False)
+
+    out_path, error = await runtime._resolve_writable_file_path(
+        raw_path=None,
+        default_filename="photo.jpg",
+        ctx=None,
+        tool_name="download_media",
+    )
+    assert error is None
+    assert out_path == downloads_root / "photo.jpg"
+
+
+@pytest.mark.asyncio
+async def test_resolve_writable_file_path_default_uses_downloads_subdir_on_other_roots(
+    tmp_path, monkeypatch
+):
+    other_root = (tmp_path / "workspace").resolve()
+    other_root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [other_root])
+    monkeypatch.delenv("TELEGRAM_DOWNLOAD_SUBDIR", raising=False)
+
+    out_path, error = await runtime._resolve_writable_file_path(
+        raw_path=None,
+        default_filename="photo.jpg",
+        ctx=None,
+        tool_name="download_media",
+    )
+    assert error is None
+    assert out_path == other_root / "downloads" / "photo.jpg"
+
+
+@pytest.mark.asyncio
+async def test_resolve_writable_file_path_custom_and_empty_download_subdir(tmp_path, monkeypatch):
+    other_root = (tmp_path / "workspace").resolve()
+    other_root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [other_root])
+
+    monkeypatch.setenv("TELEGRAM_DOWNLOAD_SUBDIR", "custom_inbox")
+    out_path, error = await runtime._resolve_writable_file_path(
+        raw_path=None,
+        default_filename="doc.pdf",
+        ctx=None,
+        tool_name="download_media",
+    )
+    assert error is None
+    assert out_path == other_root / "custom_inbox" / "doc.pdf"
+
+    monkeypatch.setenv("TELEGRAM_DOWNLOAD_SUBDIR", "")
+    out_path_empty, error = await runtime._resolve_writable_file_path(
+        raw_path=None,
+        default_filename="doc.pdf",
+        ctx=None,
+        tool_name="download_media",
+    )
+    assert error is None
+    assert out_path_empty == other_root / "doc.pdf"
 
 
 def test_roots_unsupported_detection():
@@ -1709,7 +1846,8 @@ def test_resolve_session_path_resolves_in_subdirectory(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, "PROJECT_ROOT", str(fake_root))
     monkeypatch.chdir(sub_dir)
 
-    # Even if the file does not exist yet, running from a subdirectory resolves against project root
+    # Even if the file does not exist yet, running from a subdirectory
+    # resolves against project root
     resolved = runtime._resolve_session_path("new_account")
     assert resolved == str(fake_root / "new_account")
 
