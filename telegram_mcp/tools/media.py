@@ -11,6 +11,7 @@ from pypdf import PdfReader
 from telegram_mcp.runtime import *
 
 from telegram_mcp import video
+from telegram_mcp.tools.messages import _default_parse_mode
 from telegram_mcp.sent import chat_id_of, sent_ids, sent_note
 from telegram_mcp.contact_sheet import ContactSheetUnavailable, build_contact_sheet
 from telegram_mcp.photo_source import (
@@ -39,6 +40,20 @@ def _force_document_kwargs(force_document: bool) -> Dict[str, bool]:
     # Only pass force_document when the caller set it, so the default call
     # reaches Telethon exactly as before.
     return {"force_document": True} if force_document else {}
+
+
+async def _send_file_with_default(cl, entity, file, caption, parse_mode, **kwargs):
+    """cl.send_file with the caption's parse mode: the caller's, else TELEGRAM_DEFAULT_PARSE_MODE
+    (resent with a plain caption if Telegram rejects that formatting), else Telethon's default."""
+    parse_mode, defaulted = _default_parse_mode(parse_mode) if caption else (parse_mode, False)
+    # As edit_message: an explicit None would turn Telethon's default Markdown off.
+    extra = {"parse_mode": parse_mode} if parse_mode is not None else {}
+    try:
+        return await cl.send_file(entity, file, caption=caption, **kwargs, **extra)
+    except (telethon.errors.BadRequestError, ValueError):
+        if not defaulted:
+            raise
+        return await cl.send_file(entity, file, caption=caption, parse_mode=None, **kwargs)
 
 
 class _DownloadLimitExceeded(Exception):
@@ -82,6 +97,7 @@ async def send_file(
     topic_id: Optional[int] = None,
     schedule_date: Union[str, int, None] = None,
     force_document: bool = False,
+    parse_mode: Optional[str] = None,
     ctx: Optional[Context] = None,
     account: Optional[str] = None,
 ) -> str:
@@ -101,6 +117,8 @@ async def send_file(
         force_document: When true, send the original file as a document instead of letting
             Telegram turn images and videos into compressed photos or streamed videos.
             Applies to every file of a media group.
+        parse_mode: Optional caption formatting: 'md'/'markdown' or 'html'. Omitted: the
+            server's default (TELEGRAM_DEFAULT_PARSE_MODE), else Markdown.
     """
     try:
         if isinstance(file_path, list):
@@ -111,6 +129,7 @@ async def send_file(
                 topic_id=topic_id,
                 schedule_date=schedule_date,
                 force_document=force_document,
+                parse_mode=parse_mode,
                 ctx=ctx,
                 account=account,
             )
@@ -131,10 +150,12 @@ async def send_file(
             return path_error
         entity = await resolve_entity(chat_id, cl)
         # A document keeps the file as it is: no video probe, no thumbnail.
-        sent = await cl.send_file(
+        sent = await _send_file_with_default(
+            cl,
             entity,
             str(safe_path) if force_document else await _video_media(cl, str(safe_path)),
-            caption=caption,
+            caption,
+            parse_mode,
             reply_to=topic_id,
             schedule=dt,
             **_force_document_kwargs(force_document),
@@ -163,6 +184,7 @@ async def _send_album(
     topic_id: Optional[int] = None,
     schedule_date: Union[str, int, None] = None,
     force_document: bool = False,
+    parse_mode: Optional[str] = None,
     ctx: Optional[Context] = None,
     account: str = None,
 ) -> str:
@@ -189,10 +211,12 @@ async def _send_album(
 
     entity = await resolve_entity(chat_id, cl)
     items = safe_paths if force_document else [await _video_media(cl, path) for path in safe_paths]
-    sent = await cl.send_file(
+    sent = await _send_file_with_default(
+        cl,
         entity,
         items,
-        caption=caption,
+        caption,
+        parse_mode,
         reply_to=topic_id,
         schedule=dt,
         **_force_document_kwargs(force_document),
@@ -216,6 +240,7 @@ async def send_album(
     caption: Optional[str] = None,
     topic_id: Optional[int] = None,
     schedule_date: Union[str, int, None] = None,
+    parse_mode: Optional[str] = None,
     ctx: Optional[Context] = None,
     account: Optional[str] = None,
 ) -> str:
@@ -231,6 +256,8 @@ async def send_album(
         schedule_date: Optional. When set, the album is placed in the chat's
             scheduled queue instead of being sent now. Either an ISO-8601 string
             or a Unix timestamp (int). Naive datetimes are treated as UTC.
+        parse_mode: Optional caption formatting: 'md'/'markdown' or 'html'. Omitted: the
+            server's default (TELEGRAM_DEFAULT_PARSE_MODE), else Markdown.
     """
     try:
         if not isinstance(file_paths, list):
@@ -241,6 +268,7 @@ async def send_album(
             caption=caption,
             topic_id=topic_id,
             schedule_date=schedule_date,
+            parse_mode=parse_mode,
             ctx=ctx,
             account=account,
         )

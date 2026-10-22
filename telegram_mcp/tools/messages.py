@@ -535,7 +535,6 @@ def format_message_line(msg, chat_id: Optional[int] = None, forum: bool = False)
     return " | ".join(parts) + f" | Message: {safe_text}"
 
 
-
 def _default_parse_mode(parse_mode, format_date=None, custom_emojis=None):
     """Apply TELEGRAM_DEFAULT_PARSE_MODE (e.g. 'md') when the caller gave none.
 
@@ -545,6 +544,7 @@ def _default_parse_mode(parse_mode, format_date=None, custom_emojis=None):
     if parse_mode or format_date or custom_emojis:
         return parse_mode, False
     import os
+
     default = (os.getenv("TELEGRAM_DEFAULT_PARSE_MODE") or "").strip().lower()
     if default in ("", "plain", "none"):
         return parse_mode, False
@@ -559,6 +559,7 @@ async def _send_with_default(cl, entity, text, parse_mode, defaulted, **kwargs):
         if not defaulted:
             raise
         return await cl.send_message(entity, text, parse_mode=None, **kwargs)
+
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Messages", openWorldHint=True, readOnlyHint=True))
 @with_account(readonly=True)
@@ -2083,8 +2084,9 @@ async def edit_message(
             'html', or 'rich'/'rich_markdown'/'rich_html' for full server-side formatting
             (tables, headings, formulas; REQUIRES Telegram Premium — without it nothing is
             changed and a structured telegram_premium_required result is returned).
-            Omitting it keeps the previous behavior of this tool: Telethon's client
-            default (Markdown), so **bold** in existing edits still renders.
+            Omitting it uses TELEGRAM_DEFAULT_PARSE_MODE when the server sets one (and
+            resends as plain text if Telegram rejects that formatting), else Telethon's
+            client default (Markdown), so **bold** in existing edits still renders.
     """
     try:
         cl = get_client(account)
@@ -2107,12 +2109,21 @@ async def edit_message(
                 )
             )
             return f"Message {message_id} edited."
-        # Only pass parse_mode when the caller set it: Telethon treats an explicit
-        # None as "disable parsing", while omitting the argument uses its default
-        # parser. Passing None unconditionally would turn previously formatted
-        # edits into literal text.
+        # Only pass parse_mode when the caller (or TELEGRAM_DEFAULT_PARSE_MODE) set it:
+        # Telethon treats an explicit None as "disable parsing", while omitting the
+        # argument uses its default parser. Passing None unconditionally would turn
+        # previously formatted edits into literal text.
+        parse_mode, defaulted = _default_parse_mode(parse_mode)
         extra = {"parse_mode": parse_mode} if parse_mode is not None else {}
-        await cl.edit_message(entity, message_id, new_text, **extra)
+        try:
+            await cl.edit_message(entity, message_id, new_text, **extra)
+        except telethon.errors.MessageNotModifiedError:
+            raise
+        except (telethon.errors.BadRequestError, ValueError):
+            if not defaulted:
+                raise
+            # The server's default formatting was rejected: the text as it is.
+            await cl.edit_message(entity, message_id, new_text, parse_mode=None)
         return f"Message {message_id} edited."
     except telethon.errors.MessageNotModifiedError:
         return MESSAGE_NOT_MODIFIED.format(message_id=message_id)
