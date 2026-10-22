@@ -424,9 +424,10 @@ async def test_tagged_message_reaches_the_incoming_notification():
         event = FakeEvent(FakeMessage(id=100, text="hello"), make_chat("dm"), make_user(42))
         event.out = False
         await handlers["NewMessage"](event)
-        assert len(sent) == 1
-        method, params = sent[0]
-        assert method == "channels/incoming"
+        # homelab registers a chat it first hears from (channels/changed) before delivering it.
+        incoming = [(m, p) for m, p in sent if m == "channels/incoming"]
+        assert len(incoming) == 1
+        method, params = incoming[0]
         assert set(params["messages"][0]["tags"]) == {
             "chat:dm",
             "chat:private",

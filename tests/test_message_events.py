@@ -541,7 +541,7 @@ def send_client(monkeypatch):
 async def test_send_message_names_the_sent_id(send_client):
     result = await messages.send_message(42, "hello", account="test")
 
-    assert result == "Message sent successfully. message_id=5515"
+    assert result == "Message sent (message_id 5515, chat_id 42)."
     assert send_client.send_message.call_args.kwargs["reply_to"] is None
 
 
@@ -549,7 +549,7 @@ async def test_send_message_names_the_sent_id(send_client):
 async def test_send_message_replies_and_names_the_id(send_client):
     result = await messages.send_message(42, "hello", reply_to=5513, account="test")
 
-    assert result.endswith("message_id=5515")
+    assert result == "Message sent (message_id 5515, chat_id 42)."
     assert send_client.send_message.call_args.kwargs["reply_to"] == 5513
 
 

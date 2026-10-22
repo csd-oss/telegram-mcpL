@@ -52,7 +52,8 @@ async def test_send_rich_with_premium_sends_rich_request():
     cl = _FakeClient(premium=True)
     result = json.loads(await messages._send_rich(cl, "peer", "| a |", "rich", reply_to=5))
 
-    assert result == {"sent": True, "rich": True, "message_id": None}
+    # The fake names no id, and homelab then leaves "message_id" out.
+    assert result == {"sent": True, "rich": True}
     (req,) = cl.requests
     assert isinstance(req.rich_message, runtime.types.InputRichMessageMarkdown)
     assert req.reply_to.reply_to_msg_id == 5

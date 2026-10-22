@@ -39,7 +39,9 @@ async def test_single_file_omits_force_document_by_default(client_and_root):
 
     result = await media.send_file("Chat", "shot.png", caption="cap")
 
-    assert result == f"File sent to chat Chat from {root / 'shot.png'}."
+    assert result == (
+        f"File sent from {root / 'shot.png'} (message_id not returned by Telegram, chat_id Chat)."
+    )
     assert client.calls == [
         {
             "entity": "entity:Chat",
@@ -57,7 +59,9 @@ async def test_single_file_force_document_true_is_passed_through(client_and_root
 
     result = await media.send_file("Chat", "shot.png", caption="cap", force_document=True)
 
-    assert result == f"File sent to chat Chat from {root / 'shot.png'}."
+    assert result == (
+        f"File sent from {root / 'shot.png'} (message_id not returned by Telegram, chat_id Chat)."
+    )
     assert client.calls == [
         {
             "entity": "entity:Chat",
@@ -76,7 +80,7 @@ async def test_album_omits_force_document_by_default(client_and_root):
 
     result = await media.send_file("Chat", ["one.png", "two.png"])
 
-    assert result == "Album sent to chat Chat with 2 files."
+    assert result == "Album of 2 files sent (message_id not returned by Telegram, chat_id Chat)."
     assert "force_document" not in client.calls[0]
     assert client.calls[0]["file"] == [str(root / "one.png"), str(root / "two.png")]
 
@@ -89,7 +93,7 @@ async def test_album_force_document_true_is_passed_through(client_and_root):
         "Chat", ["one.png", "two.png"], caption="pair", topic_id=9, force_document=True
     )
 
-    assert result == "Album sent to chat Chat with 2 files."
+    assert result == "Album of 2 files sent (message_id not returned by Telegram, chat_id Chat)."
     assert client.calls == [
         {
             "entity": "entity:Chat",
