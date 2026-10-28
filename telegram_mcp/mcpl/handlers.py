@@ -174,9 +174,14 @@ def make_open_handler():
         # The spec returns a ChannelDescriptor on success. The host already
         # has it from the original channels/register; echo back what they
         # asked about so the contract is satisfied.
+        # Prefer the exact registered id (MCPL `channelId`); hosts reject an
+        # answer whose id differs from the channel they asked to open.
+        address = params.get("address")
+        address_id = address.get("id") if isinstance(address, dict) else None
         return {
             "channel": {
-                "id": params.get("address", {}).get("id")
+                "id": params.get("channelId")
+                or address_id
                 or f"telegram:{params.get('type', 'unknown')}",
                 "type": params.get("type", "telegram"),
                 "label": "open-acknowledged",
