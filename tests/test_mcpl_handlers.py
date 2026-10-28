@@ -322,6 +322,22 @@ async def test_open_handler_acknowledges():
 
 
 @pytest.mark.asyncio
+async def test_open_handler_echoes_channel_id():
+    handle = make_open_handler()
+    out = await handle({"channelId": "telegram:default:dm:42", "type": "telegram", "address": None})
+    assert out["channel"]["id"] == "telegram:default:dm:42"
+
+
+@pytest.mark.asyncio
+async def test_open_handler_falls_back_to_address_id():
+    handle = make_open_handler()
+    out = await handle({"type": "telegram", "address": {"id": "telegram:default:dm:7"}})
+    assert out["channel"]["id"] == "telegram:default:dm:7"
+    out = await handle({"type": "telegram", "address": "x"})
+    assert out["channel"]["id"] == "telegram:telegram"
+
+
+@pytest.mark.asyncio
 async def test_close_handler_returns_closed_true():
     handle = make_close_handler()
     out = await handle({"channelId": "telegram:default:dm:1"})
