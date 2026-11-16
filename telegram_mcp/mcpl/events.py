@@ -167,6 +167,7 @@ def _build_speaker_header(
     author_name: str,
     sender_username: str | None,
     metadata: dict[str, Any],
+    chat_label: str | None = None,
 ) -> str:
     """Render the first-line speaker header that gets prepended to the
     agent's view of the message text. The agent's LLM sees this verbatim,
@@ -175,6 +176,7 @@ def _build_speaker_header(
     messageId, and the agent needs them for reply/edit/delete/pin.
 
     Examples:
+        "[Team Chat] BobSmith (@bobby) [message_id 311]: "
         "BobSmith (@bobby) [message_id 311]: "
         "↳ in reply to OldBobby [message_id 310]: \\"earlier message...\\"\\n"
         "BobSmith (@bobby) [message_id 311]: "
@@ -182,6 +184,8 @@ def _build_speaker_header(
     """
     author_name = _header_name(author_name)
     name_part = f"{author_name} (@{sender_username})" if sender_username else author_name
+    chat_prefix = f"[{_header_name(sanitize_name(chat_label))}] " if chat_label else ""
+    name_part = chat_prefix + name_part
     if metadata.get("messageId"):
         name_part += f" [message_id {metadata['messageId']}]"
     if metadata.get("isForward"):
@@ -201,7 +205,7 @@ def _build_speaker_header(
                 (reply_name and _header_name(reply_name), reply_id and f"[message_id {reply_id}]"),
             )
         )
-        line = f"↳ in reply to {target}" if target else "↳ in reply to"
+        line = f"↳ in reply to {chat_prefix}{target}".rstrip()
         reply_to_content = metadata.get("replyToContent")
         if reply_to_content:
             line += f': "{reply_to_content}"'
@@ -389,7 +393,11 @@ async def build_incoming_message(
     raw_content = await message_to_content_blocks(
         message, account_label=account_label, chat_id=chat_id
     )
-    header = _build_speaker_header(author["name"], sender_username, metadata)
+    # Only a DM from its own peer is unambiguous without a chat label.
+    chat_label = None
+    if chat_kind != "dm" or sender_id != chat_id:
+        chat_label = getattr(chat, "title", None) or str(chat_id)
+    header = _build_speaker_header(author["name"], sender_username, metadata, chat_label)
     content = _prepend_speaker_header(raw_content, header)
 
     # The core chat:* tags, as discord-mcpl emits them: every message carries

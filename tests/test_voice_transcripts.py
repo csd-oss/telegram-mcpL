@@ -577,14 +577,15 @@ async def test_transcribe_voice_long_run_continues_in_background(
 
 
 @pytest.mark.asyncio
-async def test_transcribe_voice_late_result_is_pushed(monkeypatch, transcript_cache_dir):
+@pytest.mark.parametrize("title", [None, "UNITE Frontend Deployment", "Команда\n[dev]"])
+async def test_transcribe_voice_late_result_is_pushed(monkeypatch, transcript_cache_dir, title):
     """With push/event available, a caller told "running" needn't poll: the
     finished transcript is pushed once, with the message id in it."""
     from telegram_mcp.mcpl import push
 
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "on-demand")
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE_WAIT_SECONDS", "0.05")
-    entity = SimpleNamespace()
+    entity = SimpleNamespace(title=title)
     client = _FakeClient(messages_by_id={8: _voice_msg(id=8)})
     _patch_client(monkeypatch, client, entity, 1)
     release = asyncio.Event()
@@ -617,8 +618,14 @@ async def test_transcribe_voice_late_result_is_pushed(monkeypatch, transcript_ca
     event_id, text, origin = pushed[0]
     assert event_id.startswith("transcript:1:8:telegram:")
     assert "message_id 8" in text and "довга розповідь" in text
+    label = {
+        None: "1",
+        "UNITE Frontend Deployment": "[UNITE Frontend Deployment] (1)",
+        "Команда\n[dev]": "[Команда (dev)] (1)",
+    }[title]
+    assert text.startswith(f"Transcript of voice message_id 8 in chat {label} (")
     assert "not a verbatim quote" in text
-    assert origin["messageId"] == 8
+    assert origin == {"source": "telegram", "kind": "transcript", "chatId": 1, "messageId": 8}
     assert transcription.get_cached_transcript(1, 8)["text"] == "довга розповідь"
 
 
@@ -628,7 +635,7 @@ async def test_transcribe_voice_late_failure_is_pushed(monkeypatch, transcript_c
 
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "on-demand")
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE_WAIT_SECONDS", "0.05")
-    entity = SimpleNamespace()
+    entity = SimpleNamespace(title="Team")
     client = _FakeClient(messages_by_id={9: _voice_msg(id=9)})
     _patch_client(monkeypatch, client, entity, 1)
     release = asyncio.Event()
@@ -653,6 +660,7 @@ async def test_transcribe_voice_late_failure_is_pushed(monkeypatch, transcript_c
             break
         await asyncio.sleep(0.01)
     assert pushed and "failed: HTTP 500 from engine" in pushed[0]
+    assert pushed[0].startswith("Transcription of voice message_id 9 in chat [Team] (1) failed:")
     assert transcription.get_cached_transcript(1, 9) is None
 
 

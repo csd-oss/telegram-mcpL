@@ -40,6 +40,7 @@ from typing import Optional
 import httpx
 from telethon.tl import functions
 
+from sanitize import sanitize_name
 from telegram_mcp.runtime import account_is_premium, get_marked_id, is_premium_rpc_error
 
 # ---------------------------------------------------------------------------
@@ -729,8 +730,14 @@ def _wait_seconds() -> float:
     return _env_float("TELEGRAM_TRANSCRIBE_WAIT_SECONDS", TRANSCRIBE_WAIT_DEFAULT_SECONDS)
 
 
-def _late_result_text(chat_id: int, message_id, result: dict) -> str:
-    where = f"voice message_id {message_id} in chat {chat_id}"
+def _late_result_text(
+    chat_id: int, message_id, result: dict, chat_title: str | None = None
+) -> str:
+    chat_label = str(chat_id)
+    if chat_title:
+        title = sanitize_name(chat_title).replace("[", "(").replace("]", ")")
+        chat_label = f"[{title}] ({chat_id})"
+    where = f"voice message_id {message_id} in chat {chat_label}"
     status = result.get("status")
     if status == "ok":
         meta = ", ".join(
@@ -768,7 +775,7 @@ async def _deliver_late(key, entry: dict, task) -> None:
     chat_id, message_id, engine = key
     await push.push_text(
         f"transcript:{chat_id}:{message_id}:{engine}:{entry['started']:.0f}",
-        _late_result_text(chat_id, message_id, result),
+        _late_result_text(chat_id, message_id, result, entry.get("chat_title")),
         {"source": "telegram", "kind": "transcript", "chatId": chat_id, "messageId": message_id},
     )
 
@@ -800,7 +807,12 @@ async def transcribe_background(
         task = asyncio.create_task(
             transcribe_cached(cl, entity, msg, engine, chat_id, duration=duration)
         )
-        entry = {"task": task, "started": asyncio.get_running_loop().time(), "deferred": False}
+        entry = {
+            "task": task,
+            "started": asyncio.get_running_loop().time(),
+            "deferred": False,
+            "chat_title": getattr(entity, "title", None),
+        }
         _BACKGROUND[key] = entry
         task.add_done_callback(lambda t, e=entry: _finished(key, e, t))
     try:
@@ -812,6 +824,7 @@ async def transcribe_background(
             "elapsed": round(asyncio.get_running_loop().time() - entry["started"]),
             "push": push.available(),
         }
+
 
 # ---------------------------------------------------------------------------
 # Batch budget for auto-mixing (mode="auto" only)
