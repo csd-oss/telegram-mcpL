@@ -45,7 +45,7 @@ from telethon.tl.types import (
 )
 
 from sanitize import sanitize_name
-from telegram_mcp import polls
+from telegram_mcp import polls, transcription
 
 from .access import chat_allowed
 from .channels import (
@@ -668,7 +668,7 @@ async def attach_event_handlers(
     self_id = int(getattr(me, "id"))
     self_username = getattr(me, "username", None)
 
-    async def push_incoming(payloads: list[ChannelIncomingMessage], get_chat) -> None:
+    async def push_incoming(payloads: list[ChannelIncomingMessage], get_chat) -> bool:
         if policy is not None and not policy.can_push_incoming:
             log.info(
                 "channels/incoming suppressed — channels.incoming not granted "
@@ -676,7 +676,7 @@ async def attach_event_handlers(
                 policy.policy_received,
                 policy.fs_enabled,
             )
-            return
+            return False
         channel_id = payloads[0]["channelId"]
         if (policy is None or policy.can_register) and not is_registered(channel_id):
             # Best effort: a failed registration must not cost the message itself.
@@ -690,9 +690,10 @@ async def attach_event_handlers(
             except Exception:  # noqa: BLE001
                 log.warning("could not register %s before its first message", channel_id)
         await transport.send_notification("channels/incoming", {"messages": payloads})
+        return True
 
     @client.on(events.NewMessage)
-    async def on_new_message(event):  # pragma: no cover — real-Telegram path
+    async def on_new_message(event):
         # Skip outgoing messages — Telethon fires NewMessage for messages we
         # send too, and bouncing the agent's own posts back to the host as
         # fresh incoming would create an echo loop (the gate would re-trigger,
@@ -709,7 +710,16 @@ async def attach_event_handlers(
             )
             if payload is None:
                 return
-            await push_incoming([payload], lambda: event.get_chat())
+            delivered = await push_incoming([payload], lambda: event.get_chat())
+            if (
+                delivered
+                and transcription.transcribe_mode() == "auto"
+                and transcription.is_transcribable(event.message)
+            ):
+                chat = await event.get_chat()
+                transcription.start_incoming_transcription(
+                    client, chat, event.message, utils.get_peer_id(chat)
+                )
         except Exception:
             log.exception("Failed to push NewMessage event")
 

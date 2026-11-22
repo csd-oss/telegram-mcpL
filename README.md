@@ -104,7 +104,7 @@ Aliases live in `${XDG_STATE_HOME:-~/.local/state}/telegram-mcp/aliases.json` (o
 
 ### Voice transcription
 
-`transcribe_voice(chat_id, message_id, engine=None)` turns a voice message or video note into text. Four engines are available:
+`transcribe_voice(chat_id, message_id, engine=None, prompt=None)` turns a voice message or video note into text. Four engines are available:
 
 - `groq` (default): uploads the recording to Groq's hosted `whisper-large-v3-turbo`. Leaves the server and costs a download+upload per call, but doesn't drop the recording's last few words the way native transcription does. Requires `GROQ_API_KEY`. Groq caps the size of a single upload, so a recording above `TELEGRAM_TRANSCRIBE_GROQ_MAX_MB` (default 25, the free-tier limit) is refused locally with a `too_large` error naming its size instead of being downloaded and rejected by the API. Raise the limit if your Groq tier allows bigger files, or transcribe that message with `engine='telegram'`, which has no such cap.
 - `telegram`: native Telegram Premium transcription (`messages.TranscribeAudioRequest`). Free and never leaves Telegram, but empirically drops the last speech segment in roughly 2 of 3 recordings and requires Telegram Premium on the account. Long recordings come back `pending` and are polled automatically.
@@ -407,9 +407,10 @@ does reliably block is the careless case: extensionless secrets such as
 leave them out of the list yourself.
 
 Voice transcription (see [Voice transcription](#voice-transcription) above) is
-off by default in the sense that no transcript is ever fetched unless you ask
-for one — `transcribe_voice` is always available, and listings only pick up
-already-cached transcripts. Enable prefetching or pick an engine explicitly:
+on-demand by default. `transcribe_voice` requests a transcript, and listings
+display cached transcripts. With `auto`, the server also transcribes incoming
+voice notes in the background and pushes results to MCPL hosts that grant
+`telegram.transcripts`. It also prefetches transcripts for listings.
 
 ```env
 TELEGRAM_TRANSCRIBE=on-demand       # off / on-demand (default) / auto
@@ -424,6 +425,14 @@ Premium on the account; `engine=openai` requires `TELEGRAM_TRANSCRIBE_OPENAI_URL
 prefetches per listing call; `TELEGRAM_TRANSCRIPT_CACHE_DIR` (default
 `data/transcripts`) sets where the SQLite cache is written; `TELEGRAM_TRANSCRIBE_GROQ_MAX_MB`
 (default 25) is the largest recording the groq engine will upload.
+
+The `openai` engine accepts a vocabulary or context hint in the optional
+`prompt` argument. An explicit empty string clears the hint for that call.
+Otherwise, `TELEGRAM_TRANSCRIBE_PROMPT_FILE` points to a UTF-8 file the server
+reads for each transcription. A configured file that is missing or blank
+clears the hint. Without a file path, `TELEGRAM_TRANSCRIBE_OPENAI_PROMPT`
+supplies the hint. The server trims the prompt to 1000 characters and caches
+transcripts separately for each effective prompt.
 
 Telegram rate limits (`FloodWaitError`) are surfaced transparently to MCP clients and LLM agents with the exact wait duration and an explicit instruction not to retry immediately.
 

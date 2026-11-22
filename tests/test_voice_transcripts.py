@@ -454,7 +454,7 @@ async def test_transcribe_voice_defaults_to_configured_engine(monkeypatch, trans
 
     seen_engine = {}
 
-    async def _fake_transcribe(cl, ent, msg, engine):
+    async def _fake_transcribe(cl, ent, msg, engine, *, prompt=None):
         seen_engine["engine"] = engine
         return {"status": "ok", "text": "x"}
 
@@ -477,7 +477,7 @@ async def test_transcribe_voice_explicit_engine_overrides_default(
 
     seen_engine = {}
 
-    async def _fake_transcribe(cl, ent, msg, engine):
+    async def _fake_transcribe(cl, ent, msg, engine, *, prompt=None):
         seen_engine["engine"] = engine
         return {"status": "ok", "text": "x"}
 
@@ -526,6 +526,55 @@ async def test_transcribe_voice_openai_caches_under_its_own_engine(
     assert result["text"] == "openai text"
     assert result["source"] == "openai"
     assert transcription.get_cached_transcript(1, 5, source="openai")["text"] == "openai text"
+
+
+@pytest.mark.asyncio
+async def test_transcribe_voice_cache_and_concurrent_calls_use_effective_prompt(
+    monkeypatch, transcript_cache_dir, tmp_path
+):
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_ENGINE", "openai")
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_URL", "http://localhost:5092/v1")
+    path = tmp_path / "vocabulary"
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_PROMPT_FILE", str(path))
+    path.write_text("First vocabulary", encoding="utf-8")
+    transcription.save_transcript(1, 5, "openai", "legacy transcript")
+    client = _FakeClient(messages_by_id={5: _voice_msg(id=5)})
+    _patch_client(monkeypatch, client, SimpleNamespace(), 1)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    seen = []
+
+    async def fake_transcribe(cl, entity, msg, engine, *, prompt):
+        seen.append(prompt)
+        if prompt == "First vocabulary":
+            started.set()
+            await release.wait()
+        return {"status": "ok", "text": f"Transcript {prompt}"}
+
+    monkeypatch.setattr(transcription, "transcribe", fake_transcribe)
+
+    async def call(**kwargs):
+        return json.loads(await messages.transcribe_voice(chat_id=1, message_id=5, **kwargs))
+
+    first = asyncio.create_task(call())
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        path.write_text("Second vocabulary", encoding="utf-8")
+        changed = await asyncio.wait_for(call(), 2)
+        override = await call(prompt=" One-off vocabulary ")
+    finally:
+        release.set()
+        initial = await first
+
+    assert seen == ["First vocabulary", "Second vocabulary", "One-off vocabulary"]
+    assert initial["text"] == "Transcript First vocabulary"
+    assert changed["text"] == "Transcript Second vocabulary"
+    assert override["text"] == "Transcript One-off vocabulary"
+    assert changed["source"] == override["source"] == "openai"
+    assert (await call(prompt="One-off vocabulary"))["cached"] is True
+    assert (await call())["text"] == changed["text"]
+    assert (await call(prompt=""))["text"] == "legacy transcript"
+    assert transcription.get_cached_transcript(1, 5)["source"] == "openai"
 
 
 @pytest.mark.asyncio

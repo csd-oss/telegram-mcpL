@@ -587,7 +587,7 @@ async def test_prefetch_fills_cache_up_to_voice_budget(monkeypatch, transcript_c
 
     calls = []
 
-    async def _fake_transcribe(cl, entity, msg, engine):
+    async def _fake_transcribe(cl, entity, msg, engine, *, prompt=None):
         calls.append(msg.id)
         return {"status": "ok", "text": f"text-{msg.id}", "lang": "ru"}
 
@@ -608,7 +608,7 @@ async def test_prefetch_skips_cached_and_already_texted_messages(
     transcription.save_transcript(7, 1, "telegram", "already have it")
     calls = []
 
-    async def _fake_transcribe(cl, entity, msg, engine):
+    async def _fake_transcribe(cl, entity, msg, engine, *, prompt=None):
         calls.append(msg.id)
         return {"status": "ok", "text": "new"}
 
@@ -624,7 +624,7 @@ async def test_prefetch_skips_cached_and_already_texted_messages(
 async def test_prefetch_swallows_engine_errors_without_raising(monkeypatch, transcript_cache_dir):
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "auto")
 
-    async def _boom(cl, entity, msg, engine):
+    async def _boom(cl, entity, msg, engine, *, prompt=None):
         raise RuntimeError("network down")
 
     monkeypatch.setattr(transcription, "transcribe", _boom)
@@ -653,7 +653,7 @@ async def test_prefetch_does_not_cache_pending_results(monkeypatch, transcript_c
 
 
 def _counting_engine(counter, text="hello"):
-    async def _fake(cl, entity, msg, engine):
+    async def _fake(cl, entity, msg, engine, *, prompt=None):
         counter["calls"] += 1
         # Long enough for a second caller to reach the same key meanwhile.
         await asyncio.sleep(0.02)
@@ -714,7 +714,7 @@ async def test_dedup_is_keyed_by_engine(transcript_cache_dir, monkeypatch):
 async def test_failed_transcription_is_not_cached_and_leaks_no_lock(
     transcript_cache_dir, monkeypatch
 ):
-    async def _failing(cl, entity, msg, engine):
+    async def _failing(cl, entity, msg, engine, *, prompt=None):
         return {"status": "error", "error": "groq request failed: 503"}
 
     monkeypatch.setattr(transcription, "transcribe", _failing)
@@ -889,7 +889,46 @@ async def test_openai_compatible_keyless_server_with_language_hint(monkeypatch):
     assert calls[0]["url"] == "http://localhost:5092/v1/audio/transcriptions"
     assert calls[0]["headers"] == {}
     assert calls[0]["data"]["language"] == "nl"
+    assert "prompt" not in calls[0]["data"]
     assert calls[0]["files"]["file"][0] == "voice.ogg"
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_reads_live_prompt_and_env_fallback(monkeypatch, tmp_path, caplog):
+    path = tmp_path / "vocabulary"
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_PROMPT_FILE", str(path))
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_PROMPT", " Env vocabulary ")
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_URL", "http://localhost:5092/v1")
+    monkeypatch.setenv("GROQ_API_KEY", "test")
+    calls = []
+    response = _FakeGroqResponse({"text": "transcript"})
+    monkeypatch.setattr(
+        transcription.httpx, "AsyncClient", lambda **kw: _FakeHttpxClient(response, calls)
+    )
+    client = _bytes_client()
+    msg = _voice_msg()
+
+    await transcription.transcribe(client, None, msg, "openai")  # missing file
+    path.write_text(" \n ", encoding="utf-8")
+    await transcription.transcribe(client, None, msg, "openai")
+    path.write_text("  Київ, Ґанок \n", encoding="utf-8")
+    await transcription.transcribe(client, None, msg, "openai")
+    path.write_text("  " + "ї" * 1000 + " omitted-vocabulary \n", encoding="utf-8")
+    await transcription.transcribe(client, None, msg, "openai")
+    monkeypatch.delenv("TELEGRAM_TRANSCRIBE_PROMPT_FILE")
+    await transcription.transcribe(client, None, msg, "openai")
+    await transcription.transcribe(client, None, msg, "groq")
+
+    assert [call["data"].get("prompt") for call in calls] == [
+        None,
+        None,
+        "Київ, Ґанок",
+        "ї" * 1000,
+        "Env vocabulary",
+        None,
+    ]
+    assert "Truncating OpenAI transcription prompt to 1000 characters" in caplog.text
+    assert "omitted-vocabulary" not in caplog.text
 
 
 @pytest.mark.asyncio

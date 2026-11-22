@@ -27,8 +27,10 @@ alongside ``text`` rather than presenting it as exact speech.
 """
 
 import asyncio
+import hashlib
 import importlib.util
 import io
+import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager
@@ -54,6 +56,7 @@ GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "whisper-large-v3-turbo"
 
 OPENAI_DEFAULT_MODEL = "whisper-1"
+OPENAI_PROMPT_MAX_CHARS = 1000
 
 WHISPER_DEFAULT_MODEL = "small"
 
@@ -67,6 +70,13 @@ HTTP_DEFAULT_TIMEOUT_SECONDS = 120.0
 # actionable message instead of a 413 from the API after a full download.
 GROQ_DEFAULT_MAX_MB = 25.0
 
+log = logging.getLogger(__name__)
+# The package logger only emits errors. Send prompt warnings to stderr.
+log.setLevel(logging.WARNING)
+prompt_warning_handler = logging.StreamHandler()
+prompt_warning_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+log.addHandler(prompt_warning_handler)
+
 
 def transcribe_mode() -> str:
     """``TELEGRAM_TRANSCRIBE``: off | on-demand | auto (default on-demand).
@@ -74,8 +84,8 @@ def transcribe_mode() -> str:
     ``off`` disables the dedicated tool and all auto-mixing. ``on-demand``
     (default) keeps the dedicated tool and fills cache hits into listings,
     but never spends a batch call fetching a new one. ``auto`` additionally
-    prefetches missing transcripts into listings, bounded by
-    :class:`TranscribeBudget`.
+    transcribes incoming voice notes and prefetches missing transcripts into
+    listings, bounded by :class:`TranscribeBudget`.
     """
     raw = os.getenv("TELEGRAM_TRANSCRIBE", "on-demand").strip().lower()
     if raw not in _TRANSCRIBE_MODES:
@@ -119,6 +129,37 @@ def transcribe_language() -> Optional[str]:
     """
     raw = os.getenv("TELEGRAM_TRANSCRIBE_LANGUAGE", "").strip().lower()
     return raw or None
+
+
+def resolve_prompt(engine: str, override: Optional[str] = None) -> str:
+    """Resolve the OpenAI prompt once per request, before looking in the cache."""
+    if engine != "openai":
+        return ""
+    prompt = override
+    if prompt is None:
+        path = os.getenv("TELEGRAM_TRANSCRIBE_PROMPT_FILE", "").strip()
+        if path:
+            try:
+                prompt = Path(path).read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return ""
+            except (OSError, UnicodeError):
+                log.warning("Could not read TELEGRAM_TRANSCRIBE_PROMPT_FILE as UTF-8")
+                return ""
+        else:
+            prompt = os.getenv("TELEGRAM_TRANSCRIBE_OPENAI_PROMPT", "")
+
+    prompt = prompt.strip()
+    if len(prompt) > OPENAI_PROMPT_MAX_CHARS:
+        log.warning(
+            "Truncating OpenAI transcription prompt to %d characters", OPENAI_PROMPT_MAX_CHARS
+        )
+        prompt = prompt[:OPENAI_PROMPT_MAX_CHARS].rstrip()
+    return prompt
+
+
+def prompt_cache_hash(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest() if prompt else ""
 
 
 def _env_float(name: str, default: float) -> float:
@@ -284,6 +325,19 @@ def _connect() -> sqlite3.Connection:
         )
         """)
     _migrate_source_into_key(conn)
+    # Keep the existing table readable by older builds, including on rollback.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS prompted_transcripts (
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            prompt_hash TEXT NOT NULL,
+            text TEXT NOT NULL,
+            duration INTEGER,
+            lang TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (chat_id, message_id, prompt_hash)
+        )
+        """)
     conn.commit()
     try:
         os.chmod(path, 0o600)
@@ -324,19 +378,24 @@ def _migrate_source_into_key(conn: sqlite3.Connection) -> None:
 
 
 def get_cached_transcript(
-    chat_id: int, message_id: int, source: Optional[str] = None
+    chat_id: int, message_id: int, source: Optional[str] = None, *, prompt_hash: str = ""
 ) -> Optional[dict]:
     """Cached transcript for a message.
 
-    ``source`` pins the engine: asking for groq must never be answered with a
-    telegram transcript, because the native engine drops the recording's last
-    segment and the loss is invisible in the text. Callers that only want to
-    display whatever exists (listings, backfill skip checks) pass None and get
-    the default engine's row when there is one, any row otherwise.
+    ``source`` pins the engine, with ``prompt_hash`` for prompted OpenAI rows.
+    Callers that display whatever is available (listings, backfill skip
+    checks) pass None and get the latest row for the default engine when
+    there is one, or the latest row overall.
     """
     conn = _connect()
     try:
-        if source is not None:
+        if source == "openai" and prompt_hash:
+            row = conn.execute(
+                "SELECT 'openai', text, duration, lang, created_at FROM prompted_transcripts "
+                "WHERE chat_id = ? AND message_id = ? AND prompt_hash = ?",
+                (chat_id, message_id, prompt_hash),
+            ).fetchone()
+        elif source is not None:
             row = conn.execute(
                 "SELECT source, text, duration, lang, created_at FROM transcripts "
                 "WHERE chat_id = ? AND message_id = ? AND source = ?",
@@ -344,10 +403,13 @@ def get_cached_transcript(
             ).fetchone()
         else:
             row = conn.execute(
+                "SELECT * FROM ("
                 "SELECT source, text, duration, lang, created_at FROM transcripts "
-                "WHERE chat_id = ? AND message_id = ? "
+                "WHERE chat_id = ? AND message_id = ? UNION ALL "
+                "SELECT 'openai', text, duration, lang, created_at FROM prompted_transcripts "
+                "WHERE chat_id = ? AND message_id = ?) "
                 "ORDER BY source = ? DESC, created_at DESC LIMIT 1",
-                (chat_id, message_id, default_engine()),
+                (chat_id, message_id, chat_id, message_id, default_engine()),
             ).fetchone()
     finally:
         conn.close()
@@ -371,17 +433,21 @@ def save_transcript(
     *,
     duration: Optional[int] = None,
     lang: Optional[str] = None,
+    prompt_hash: str = "",
 ) -> None:
     conn = _connect()
     try:
+        table, key_column, key = "transcripts", "source", source
+        if source == "openai" and prompt_hash:
+            table, key_column, key = "prompted_transcripts", "prompt_hash", prompt_hash
         conn.execute(
-            "INSERT OR REPLACE INTO transcripts "
-            "(chat_id, message_id, source, text, duration, lang, created_at) "
+            f"INSERT OR REPLACE INTO {table} "
+            f"(chat_id, message_id, {key_column}, text, duration, lang, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 chat_id,
                 message_id,
-                source,
+                key,
                 text,
                 duration,
                 lang,
@@ -495,7 +561,9 @@ def _upload_name(msg) -> tuple:
     return f"voice.{ext}", mime
 
 
-async def _transcribe_via_openai_compatible(cl, msg, cfg: HttpEngineConfig) -> dict:
+async def _transcribe_via_openai_compatible(
+    cl, msg, cfg: HttpEngineConfig, prompt: str = ""
+) -> dict:
     """POST the recording to an OpenAI-style ``/audio/transcriptions``
     endpoint (groq, openai). Deletes the bytes as soon as the
     request returns."""
@@ -511,6 +579,8 @@ async def _transcribe_via_openai_compatible(cl, msg, cfg: HttpEngineConfig) -> d
     language = transcribe_language()
     if language:
         form["language"] = language
+    if prompt:
+        form["prompt"] = prompt
     headers = {"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {}
 
     try:
@@ -609,7 +679,7 @@ async def _transcribe_via_whisper(cl, msg) -> dict:
     return {"status": "ok", "text": text, "lang": lang or language}
 
 
-async def transcribe(cl, entity, msg, engine: str) -> dict:
+async def transcribe(cl, entity, msg, engine: str, *, prompt: Optional[str] = None) -> dict:
     """Dispatch to one engine. Returns a status dict:
     {"status": "ok", "text": ..., "lang": ...} |
     {"status": "pending"} | {"status": "premium_required"} |
@@ -623,7 +693,9 @@ async def transcribe(cl, entity, msg, engine: str) -> dict:
         return await _transcribe_via_whisper(cl, msg)
     cfg = http_engine_config(engine)
     if cfg is not None:
-        return await _transcribe_via_openai_compatible(cl, msg, cfg)
+        if prompt is None:
+            prompt = resolve_prompt(engine)
+        return await _transcribe_via_openai_compatible(cl, msg, cfg, prompt)
     return {"status": "error", "error": f"Unknown engine '{engine}'"}
 
 
@@ -631,11 +703,9 @@ async def transcribe(cl, entity, msg, engine: str) -> dict:
 # One paid call per recording
 # ---------------------------------------------------------------------------
 #
-# transcribe_voice and the auto-mode prefetch both do "miss the cache,
-# transcribe, save". Two concurrent requests for the same uncached message
-# would both miss, both download the audio and both pay Groq for it. The lock
-# is keyed by (chat, message, engine) and the cache is re-read inside it, so
-# the second caller returns the first one's transcript without a second call.
+# Tool calls, incoming events and auto-mode prefetch share one cache. Reading
+# it inside the lock lets concurrent requests for the same recording, engine
+# and prompt reuse the first transcript.
 #
 # Scope is one process: the server is a single asyncio process over one SQLite
 # cache. Running it as several worker processes would need an atomic claim in
@@ -675,28 +745,35 @@ def _cached_result(row: dict) -> dict:
 
 
 async def transcribe_cached(
-    cl, entity, msg, engine: str, chat_id: int, duration: Optional[int] = None
+    cl,
+    entity,
+    msg,
+    engine: str,
+    chat_id: int,
+    duration: Optional[int] = None,
+    *,
+    prompt: Optional[str] = None,
 ) -> dict:
-    """Cache-first transcription, at most one paid call per recording.
+    """Cache-first transcription, at most one paid call per recording and prompt.
 
     Same status dict as :func:`transcribe`, plus ``cached``. Every caller that
     would otherwise write to the transcript cache should go through here.
     """
     message_id = getattr(msg, "id", None)
-    hit = get_cached_transcript(chat_id, message_id, source=engine)
-    if hit is not None:
-        return _cached_result(hit)
+    if prompt is None:
+        prompt = resolve_prompt(engine)
+    prompt_hash = prompt_cache_hash(prompt)
+    key = (chat_id, message_id, engine, prompt_hash)
 
-    async with _transcribe_lock((chat_id, message_id, engine)):
-        # Re-read: a concurrent caller may have paid for this one while we
-        # were waiting for the lock.
-        hit = get_cached_transcript(chat_id, message_id, source=engine)
+    async with _transcribe_lock(key):
+        # A concurrent caller may have saved a transcript while we waited.
+        hit = get_cached_transcript(chat_id, message_id, source=engine, prompt_hash=prompt_hash)
         if hit is not None:
             return _cached_result(hit)
 
         if duration is None:
             duration = voice_duration(msg)
-        result = await transcribe(cl, entity, msg, engine)
+        result = await transcribe(cl, entity, msg, engine, prompt=prompt)
         if result.get("status") == "ok":
             save_transcript(
                 chat_id,
@@ -705,6 +782,7 @@ async def transcribe_cached(
                 result["text"],
                 duration=duration,
                 lang=result.get("lang"),
+                prompt_hash=prompt_hash,
             )
         out = dict(result)
         out["cached"] = False
@@ -772,9 +850,11 @@ async def _deliver_late(key, entry: dict, task) -> None:
         return
     exc = task.exception()
     result = {"status": "exception", "error": str(exc)} if exc else task.result()
-    chat_id, message_id, engine = key
+    if result.get("cached") and not entry["deferred"]:
+        return
+    chat_id, message_id, engine, _ = key
     await push.push_text(
-        f"transcript:{chat_id}:{message_id}:{engine}:{entry['started']:.0f}",
+        f"transcript:{chat_id}:{message_id}:{engine}:{entry['started']:.9f}",
         _late_result_text(chat_id, message_id, result, entry.get("chat_title")),
         {"source": "telegram", "kind": "transcript", "chatId": chat_id, "messageId": message_id},
     )
@@ -785,36 +865,62 @@ def _finished(key, entry: dict, task) -> None:
         _BACKGROUND.pop(key, None)
     if not task.cancelled():
         task.exception()  # retrieved, so an unawaited failure isn't logged as lost
-    if entry["deferred"]:
+    if entry["deferred"] or entry["announce"]:
         entry["delivery"] = asyncio.ensure_future(_deliver_late(key, entry, task))
 
 
+def _start_background(
+    cl, entity, msg, engine, chat_id, duration=None, *, prompt=None, announce=False
+):
+    if prompt is None:
+        prompt = resolve_prompt(engine)
+    key = (chat_id, getattr(msg, "id", None), engine, prompt_cache_hash(prompt))
+    entry = _BACKGROUND.get(key)
+    if entry is None:
+        task = asyncio.create_task(
+            transcribe_cached(cl, entity, msg, engine, chat_id, duration=duration, prompt=prompt)
+        )
+        entry = {
+            "task": task,
+            "started": asyncio.get_running_loop().time(),
+            "deferred": False,
+            "announce": announce,
+            "chat_title": getattr(entity, "title", None),
+        }
+        _BACKGROUND[key] = entry
+        task.add_done_callback(lambda t: _finished(key, entry, t))
+    elif announce:
+        entry["announce"] = True
+    return entry
+
+
+def start_incoming_transcription(cl, entity, msg, chat_id: int) -> None:
+    """Start transcribing an incoming voice note and push the result when ready."""
+    engine = default_engine()
+    if not engine_config_error(engine):
+        _start_background(cl, entity, msg, engine, chat_id, announce=True)
+
+
 async def transcribe_background(
-    cl, entity, msg, engine: str, chat_id: int, duration: Optional[int] = None
+    cl,
+    entity,
+    msg,
+    engine: str,
+    chat_id: int,
+    duration: Optional[int] = None,
+    *,
+    prompt: Optional[str] = None,
 ) -> dict:
     """:func:`transcribe_cached` that answers within the wait budget.
 
     Same status dicts, plus ``{"status": "running", "elapsed": seconds,
     "push": bool}`` when the transcription is still going; ``push`` says whether
     the result will arrive as a push/event. A repeat call for the same
-    recording and engine joins the running task instead of starting another.
+    recording, engine and prompt joins the running task.
     """
     from telegram_mcp.mcpl import push
 
-    key = (chat_id, getattr(msg, "id", None), engine)
-    entry = _BACKGROUND.get(key)
-    if entry is None:
-        task = asyncio.create_task(
-            transcribe_cached(cl, entity, msg, engine, chat_id, duration=duration)
-        )
-        entry = {
-            "task": task,
-            "started": asyncio.get_running_loop().time(),
-            "deferred": False,
-            "chat_title": getattr(entity, "title", None),
-        }
-        _BACKGROUND[key] = entry
-        task.add_done_callback(lambda t, e=entry: _finished(key, e, t))
+    entry = _start_background(cl, entity, msg, engine, chat_id, duration, prompt=prompt)
     try:
         return await asyncio.wait_for(asyncio.shield(entry["task"]), _wait_seconds())
     except asyncio.TimeoutError:
