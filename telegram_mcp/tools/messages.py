@@ -1581,6 +1581,7 @@ async def transcribe_voice(
     message_id: int,
     engine: Optional[str] = None,
     account: Optional[str] = None,
+    prompt: Optional[str] = None,
 ) -> str:
     """
     Transcribe a voice message or video note (video circle) to text.
@@ -1601,11 +1602,8 @@ async def transcribe_voice(
     - "whisper": a local faster-whisper model on this server. Audio never
       leaves the machine; slower on CPU.
 
-    Results are cached per engine, by (chat_id, message_id, engine) - a
-    repeat call with the same engine returns the cached text without
-    hitting any engine again. Asking for an engine that has no cached
-    result transcribes with it, even when another engine's text is
-    already cached.
+    Results are cached per recording, engine and effective prompt. Changing
+    the prompt or engine can trigger a new transcription of the same message.
 
     The returned text is a machine transcript, not a verbatim quote: proper
     names, punctuation and occasional words drift under every engine.
@@ -1616,6 +1614,9 @@ async def transcribe_voice(
         engine: "groq", "telegram", "openai" or "whisper".
             Defaults to TELEGRAM_TRANSCRIBE_ENGINE (groq unless configured
             otherwise).
+        prompt: Optional vocabulary or context for the OpenAI engine, up to
+            1000 characters. Overrides the configured prompt for this call.
+            An empty string requests transcription without a prompt.
     """
     try:
         mode = transcription.transcribe_mode()
@@ -1633,11 +1634,12 @@ async def transcribe_voice(
             accepted = ", ".join(f"'{name}'" for name in sorted(transcription.ENGINES))
             return f"Invalid engine '{engine}'. Use one of: {accepted}."
 
-        # Pinned to the chosen engine on purpose: a cached telegram transcript
-        # must not answer a request for any other engine. The native engine drops the last
-        # speech segment and the loss cannot be seen in the text.
+        effective_prompt = transcription.resolve_prompt(chosen_engine, prompt)
         cached = transcription.get_cached_transcript(
-            numeric_chat_id, message_id, source=chosen_engine
+            numeric_chat_id,
+            message_id,
+            source=chosen_engine,
+            prompt_hash=transcription.prompt_cache_hash(effective_prompt),
         )
         if cached is not None:
             return json.dumps(
@@ -1664,11 +1666,16 @@ async def transcribe_voice(
             return config_error
 
         duration = transcription.voice_duration(msg)
-        # Cache-first and locked by (chat, message, engine): two concurrent
-        # calls for the same recording pay the engine once, not twice. A long
-        # one keeps running after this call returns "running".
+        # Identical concurrent calls share the engine request. A long one
+        # keeps running after this call returns "running".
         result = await transcription.transcribe_background(
-            cl, entity, msg, chosen_engine, numeric_chat_id, duration=duration
+            cl,
+            entity,
+            msg,
+            chosen_engine,
+            numeric_chat_id,
+            duration=duration,
+            prompt=effective_prompt,
         )
 
         if result["status"] == "premium_required":

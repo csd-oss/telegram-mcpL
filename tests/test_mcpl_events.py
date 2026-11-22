@@ -1,8 +1,10 @@
 """Phase 4 tests — Telethon NewMessage event → ChannelIncomingMessage."""
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from telethon.tl.types import (
@@ -634,6 +636,64 @@ async def test_new_message_push_is_gated_on_channels_incoming_grant(monkeypatch)
     policy.apply({"effectiveCapabilities": list(FS_USES)}, is_request=True)
     await on_new_message(SimpleNamespace(out=True))
     assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_incoming_voice_uses_live_vocabulary_in_background(
+    monkeypatch, transcript_cache_dir, tmp_path
+):
+    from telethon import events
+
+    from telegram_mcp import transcription
+    from telegram_mcp.mcpl import push
+
+    reset_attached_clients()
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "auto")
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_ENGINE", "openai")
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_URL", "http://localhost:5092/v1")
+    path = tmp_path / "vocabulary"
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_PROMPT_FILE", str(path))
+    path.write_text("  Incoming vocabulary\n", encoding="utf-8")
+    handlers = {}
+
+    def on(event_type):
+        def register(handler):
+            if event_type is events.NewMessage:
+                handlers[event_type] = handler
+            return handler
+
+        return register
+
+    client = SimpleNamespace(get_me=AsyncMock(return_value=make_user(99)), on=on)
+    transport = SimpleNamespace(send_notification=AsyncMock())
+    await attach_event_handlers(client, account_label="default", transport=transport)
+
+    release = asyncio.Event()
+    pushed = asyncio.Event()
+
+    async def fake_engine(cl, msg, cfg, prompt):
+        assert cfg.engine == "openai"
+        assert prompt == "Incoming vocabulary"
+        await release.wait()
+        return {"status": "ok", "text": "decoded voice"}
+
+    async def fake_push(event_id, text, origin):
+        assert "decoded voice" in text
+        assert origin["messageId"] == 7
+        pushed.set()
+
+    monkeypatch.setattr(transcription, "_transcribe_via_openai_compatible", fake_engine)
+    monkeypatch.setattr(push, "push_text", fake_push)
+    chat = make_user(42, first="Sender")
+    msg = FakeMessage(id=7, text="")
+    msg.voice = object()
+    await asyncio.wait_for(handlers[events.NewMessage](FakeEvent(msg, chat, chat)), 2)
+
+    assert transport.send_notification.await_args.args[0] == "channels/incoming"
+    assert not pushed.is_set()
+    release.set()
+    await asyncio.wait_for(pushed.wait(), 2)
+    assert transcription.get_cached_transcript(42, 7)["text"] == "decoded voice"
 
 
 # ---------------------------------------------------------------------------
